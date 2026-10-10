@@ -1,0 +1,19 @@
+[package]
+name = "tonescope"
+version = "0.1.0"
+edition = "2021"
+description = "Real-time log-frequency spectrogram with musical scale overlays"
+
+[dependencies]
+cpal = "0.15"
+eframe = "0.29"
+realfft = "3.4"
+rtrb = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# 依赖开优化：debug 构建下 FFT 和绘制也能跑满帧率
+[profile.dev.package."*"]
+opt-level = 2
