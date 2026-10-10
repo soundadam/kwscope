@@ -12,7 +12,7 @@ registry:
   homebrew: soundadam/tap/tonescope
   docs: https://github.com/soundadam/tonescope#readme
 release:
-  version: "0.1.1"
+  version: "0.1.2"
   license: MIT OR Apache-2.0
 modules:
   - type: promo
