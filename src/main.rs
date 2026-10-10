@@ -1,3 +1,6 @@
+// release 构建在 Windows 上不弹控制台窗口；debug 保留，方便看 panic 输出
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod axis;
