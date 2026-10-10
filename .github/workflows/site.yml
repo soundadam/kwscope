@@ -1,0 +1,24 @@
+name: Site
+
+# site/ 是本项目在 soundadam.com 上的页面，站点构建时作为 Hugo module 引入；
+# main 上的文案变了，就通知 soundadam/www-src 重新构建发布。
+#
+# WWW_SRC_DISPATCH_TOKEN：fine-grained token，只给 soundadam/www-src 的
+# Contents: read and write（repository_dispatch 要的权限）。
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask soundadam.com to publish
+        env:
+          GH_TOKEN: ${{ secrets.WWW_SRC_DISPATCH_TOKEN }}
+        run: gh api repos/soundadam/www-src/dispatches -f event_type=project-site
