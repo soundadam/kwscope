@@ -2,13 +2,28 @@
 
 实时对数频谱（瀑布图）+ 音阶参考线。Rust · cpal · realfft · egui，单个可执行文件。
 
-## 运行
+## 下载
+
+推 `v*` tag 时，[release workflow](.github/workflows/release.yml) 构建 macOS（通用二进制 `.app`）、Windows（x86_64）、Linux（x86_64）三份产物，发布到 [Releases](https://github.com/soundadam/tonescope/releases)。tag 必须与 `Cargo.toml` 的版本一致。
+
+- macOS：`.app` 只有 ad-hoc 签名、未公证，首次打开要在 Finder 里右键 →「打开」。首次运行会请求麦克风权限。
+- Linux：需要系统里有 ALSA（`libasound2`）；PulseAudio / PipeWire 通过 ALSA 兼容层接入。
+
+## 从源码运行
 
 ```bash
 cargo run --release
 ```
 
-macOS 首次运行会请求麦克风权限，权限记在启动它的那个程序（Terminal / iTerm / IDE）名下。
+Linux 构建前先装 ALSA 头文件（Debian / Ubuntu：`sudo apt install libasound2-dev`）。
+
+macOS 下用 `cargo run` 时，麦克风权限记在启动它的那个程序（Terminal / iTerm / IDE）名下。
+
+本地打包与 CI 用同一个脚本，产物放在 `dist/`：
+
+```bash
+scripts/package.sh
+```
 
 界面为英文，只用 egui 自带字体。
 
@@ -33,7 +48,6 @@ macOS 首次运行会请求麦克风权限，权限记在启动它的那个程�
 - [ ] 导出当前画面 PNG、录制最近 N 秒为 WAV
 - [ ] 输入电平表与削波提示
 - [ ] 非十二平均律：纯律、五度相生律、自定义 cents 表
-- [ ] 打包 macOS `.app`（含 `NSMicrophoneUsageDescription`）与 Windows / Linux 发布产物
 - [ ] 可选 CQT / 重分配谱，提升低频分辨率
 
 ## 许可证
