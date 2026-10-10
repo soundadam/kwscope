@@ -89,6 +89,8 @@ pub struct App {
     level_gate: f32,
     show_pitch: bool,
     harmonics: bool,
+
+    updater: appkit::ui::Updater,
 }
 
 /// 音高窗长：两倍最长周期向上取 2 的幂，且不超过 FFT 帧长（取帧中央那一段，
@@ -99,7 +101,7 @@ fn pitch_window(fft_size: usize, sample_rate: f32) -> usize {
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, identity: appkit::App) -> Self {
         let analysis = Analysis {
             fft_size: 4096,
             hop: 256,
@@ -151,6 +153,7 @@ impl App {
             level_gate: -45.0,
             show_pitch: true,
             harmonics: true,
+            updater: appkit::ui::Updater::new(identity, &cc.egui_ctx),
         };
         app.switch_device(None);
         app
@@ -294,6 +297,7 @@ impl App {
                 ui.label(RichText::new(readout).monospace().size(18.0).color(GREEN));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.updater.top_bar(ui);
                     if let Some(e) = &self.error {
                         ui.label(RichText::new(e).color(Color32::LIGHT_RED));
                     } else if self.paused {
@@ -465,6 +469,9 @@ impl App {
 
         ui.separator();
         self.perf_section(ui);
+
+        ui.separator();
+        self.updater.settings(ui);
 
         ui.separator();
         ui.label(RichText::new("Space  pause / resume").small().weak());

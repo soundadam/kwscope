@@ -10,6 +10,7 @@ cask "tonescope" do
     url "https://github.com/soundadam/tonescope/releases/download/v#{version}/tonescope-#{version}-macos-universal.zip"
 
     app "Tonescope.app"
+    binary "#{appdir}/Tonescope.app/Contents/MacOS/tonescope"
 
     caveats <<~EOS
       Tonescope.app is ad-hoc signed and not notarized. Homebrew preserves
