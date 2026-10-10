@@ -2,11 +2,17 @@
 
 实时对数频谱（瀑布图）+ 音阶参考线。Rust · cpal · realfft · egui，单个可执行文件。
 
-## 下载
+## 安装
 
-推 `v*` tag 时，[release workflow](.github/workflows/release.yml) 构建 macOS（通用二进制 `.app`）、Windows（x86_64）、Linux（x86_64）三份产物，发布到 [Releases](https://github.com/soundadam/tonescope/releases)。tag 必须与 `Cargo.toml` 的版本一致。
+macOS 与 Linux（x86_64）用 Homebrew：
 
-- macOS：`.app` 只有 ad-hoc 签名、未公证，首次打开要在 Finder 里右键 →「打开」。首次运行会请求麦克风权限。
+```bash
+brew install --cask soundadam/tap/tonescope
+```
+
+Windows 从 [Releases](https://github.com/soundadam/tonescope/releases) 下载 zip。
+
+- macOS：`.app` 只有 ad-hoc 签名、未公证，首次打开会被拦下，到「系统设置 → 隐私与安全性」里点「仍要打开」。首次运行会请求麦克风权限。
 - Linux：需要系统里有 ALSA（`libasound2`）；PulseAudio / PipeWire 通过 ALSA 兼容层接入。
 
 ## 从源码运行
@@ -26,6 +32,12 @@ scripts/package.sh
 ```
 
 界面为英文，只用 egui 自带字体。
+
+## 发布
+
+推 `v*` tag（必须与 `Cargo.toml` 的版本一致），[release workflow](.github/workflows/release.yml) 构建 macOS（通用二进制 `.app`）、Windows（x86_64）、Linux（x86_64）三份产物发到 Releases，再用 [`packaging/homebrew/tonescope.rb`](packaging/homebrew/tonescope.rb) 填好版本与 SHA-256 推到 [soundadam/homebrew-tap](https://github.com/soundadam/homebrew-tap)。带 `-` 的预发布 tag 不更新 Cask。
+
+[`site/`](site/) 是 [soundadam.com/projects/tonescope](https://soundadam.com/projects/tonescope/) 的文案与截图，站点以 Hugo module 引入；main 上 `site/` 一变，[site workflow](.github/workflows/site.yml) 就通知站点重新发布。
 
 ## 现有功能
 
