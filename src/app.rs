@@ -15,6 +15,8 @@ use std::time::Instant;
 // 纹理分辨率与窗口无关，GPU 线性缩放到绘制区域
 const ROWS: usize = 600;
 const COLS: usize = 1024;
+/// 横向要绕回，见 `central` 里的 uv。
+const TEXTURE: TextureOptions = TextureOptions::LINEAR_REPEAT;
 const FFT_SIZES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
 const HOPS: [usize; 5] = [128, 256, 512, 1024, 2048];
 const FREQ_TICKS: [f32; 15] = [
@@ -69,6 +71,8 @@ pub struct App {
     colormap: Colormap,
     lut: [Color32; 256],
     texture: Option<TextureHandle>,
+    /// 纹理现有像素用的色表与 dB 范围；变了就整张重新着色。
+    painted: Option<(Colormap, f32, f32)>,
 
     scale: Option<Scale>,
     tonic: u8,
@@ -126,6 +130,7 @@ impl App {
             colormap,
             lut: colormap.lut(),
             texture: None,
+            painted: None,
             scale: Some(Scale::Chromatic),
             tonic: 0,
             a4: 440.0,
@@ -475,7 +480,8 @@ impl App {
                         "  colorize",
                         ms(p.colorize.get()),
                         String::new(),
-                        "Mapping the whole waterfall through the colormap every frame",
+                        "Colouring new waterfall columns and uploading them to the texture; \
+                         a colormap or dB range change repaints the whole image once",
                     ),
                     (
                         "  dsp",
@@ -564,20 +570,15 @@ impl App {
                 }
                 let painter = ui.painter_at(full);
 
-                let t0 = Instant::now();
-                let image = self.waterfall.render(&self.lut, self.db_lo, self.db_hi);
-                let tex_id = match &mut self.texture {
-                    Some(t) => {
-                        t.set(image, TextureOptions::LINEAR);
-                        t.id()
-                    }
-                    None => self
-                        .texture
-                        .insert(ctx.load_texture("waterfall", image, TextureOptions::LINEAR))
-                        .id(),
-                };
-                self.perf.colorize.add(t0.elapsed().as_secs_f32());
-                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                let tex_id = self.update_texture(ctx);
+                // 纹理按槽位存列，从最老的槽位起绕回一圈（REPEAT）。两端各收半个
+                // 纹素，线性插值不会把最新一列和最老一列混在一起。
+                let cols = self.waterfall.cols() as f32;
+                let head = self.waterfall.head() as f32;
+                let uv = Rect::from_min_max(
+                    pos2((head + 0.5) / cols, 0.0),
+                    pos2((head + cols - 0.5) / cols, 1.0),
+                );
                 painter.image(tex_id, spec, uv, Color32::WHITE);
 
                 self.draw_freq_ticks(&painter, spec);
@@ -590,6 +591,29 @@ impl App {
                     self.draw_hover(&painter, spec, p);
                 }
             });
+    }
+
+    /// 只给新写入的列着色并局部上传；色表或 dB 范围变了才整张重来。
+    fn update_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
+        let t0 = Instant::now();
+        let style = (self.colormap, self.db_lo, self.db_hi);
+        let mut dirty = self.waterfall.take_dirty();
+        if self.texture.is_none() || self.painted != Some(style) {
+            dirty = [0..self.waterfall.cols(), 0..0];
+            self.painted = Some(style);
+        }
+        for slots in dirty.into_iter().filter(|r| !r.is_empty()) {
+            let start = slots.start;
+            let image = self
+                .waterfall
+                .render(&self.lut, self.db_lo, self.db_hi, slots);
+            match &mut self.texture {
+                Some(t) => t.set_partial([start, 0], image, TEXTURE),
+                None => self.texture = Some(ctx.load_texture("waterfall", image, TEXTURE)),
+            }
+        }
+        self.perf.colorize.add(t0.elapsed().as_secs_f32());
+        self.texture.as_ref().expect("painted above").id()
     }
 
     fn draw_freq_ticks(&self, painter: &Painter, spec: Rect) {
