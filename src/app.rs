@@ -2,7 +2,9 @@ use crate::audio::{self, Input};
 use crate::axis::LogAxis;
 use crate::colormap::Colormap;
 use crate::dsp::{self, Stft};
+use crate::fonts;
 use crate::music::{self, Scale, NOTE_NAMES};
+use crate::pitch::Yin;
 use crate::waterfall::{RowMap, Waterfall};
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Shape, Slider,
@@ -19,6 +21,12 @@ const FREQ_TICKS: [f32; 15] = [
 ];
 const MAX_HARMONIC: u32 = 8;
 
+// 覆盖人声和多数旋律乐器的基频
+const PITCH_MIN: f32 = 40.0;
+const PITCH_MAX: f32 = 2_000.0;
+// 相邻两列音高差超过这么多半音就断开轨迹，不画竖直连线
+const MAX_TRACK_JUMP: f32 = 2.0;
+
 const HZ_GUTTER: f32 = 44.0;
 const NOTE_GUTTER: f32 = 44.0;
 const LIVE_W: f32 = 160.0;
@@ -28,6 +36,7 @@ const LABEL_SPACING: f32 = 11.0;
 const BG: Color32 = Color32::from_gray(12);
 const AMBER: Color32 = Color32::from_rgb(255, 214, 102);
 const CYAN: Color32 = Color32::from_rgb(120, 200, 255);
+const GREEN: Color32 = Color32::from_rgb(110, 255, 140);
 
 #[derive(Clone, Copy, PartialEq)]
 struct Analysis {
@@ -45,6 +54,7 @@ pub struct App {
 
     analysis: Analysis,
     stft: Stft,
+    yin: Yin,
     waterfall: Waterfall,
     peak: Option<(f32, f32)>,
     paused: bool,
@@ -59,12 +69,23 @@ pub struct App {
     scale: Option<Scale>,
     tonic: u8,
     a4: f32,
+    level_gate: f32,
+    show_pitch: bool,
     harmonics: bool,
-    peak_gate: f32,
+}
+
+/// 音高窗长：两倍最长周期向上取 2 的幂，且不超过 FFT 帧长（取帧中央那一段，
+/// 与瀑布图该列对齐）。
+fn pitch_window(fft_size: usize, sample_rate: f32) -> usize {
+    let want = ((2.0 * sample_rate / PITCH_MIN).ceil() as usize).next_power_of_two();
+    want.min(fft_size)
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if !fonts::install(&cc.egui_ctx) {
+            eprintln!("no CJK system font found; Chinese labels will not render");
+        }
         let analysis = Analysis {
             fft_size: 4096,
             hop: 256,
@@ -73,6 +94,7 @@ impl App {
             f_min: 50.0,
             f_max: 8_000.0,
         };
+        let sample_rate = 48_000.0;
         let stft = Stft::new(analysis.fft_size, analysis.hop);
         let colormap = Colormap::Magma;
         let mut app = Self {
@@ -80,12 +102,18 @@ impl App {
             device: None,
             input: None,
             error: None,
-            sample_rate: 48_000.0,
+            sample_rate,
             samples: Vec::new(),
             waterfall: Waterfall::new(
                 COLS,
-                RowMap::new(axis, ROWS, stft.bins(), 48_000.0 / analysis.fft_size as f32),
+                RowMap::new(
+                    axis,
+                    ROWS,
+                    stft.bins(),
+                    sample_rate / analysis.fft_size as f32,
+                ),
             ),
+            yin: Yin::new(pitch_window(analysis.fft_size, sample_rate), sample_rate),
             stft,
             analysis,
             peak: None,
@@ -99,8 +127,9 @@ impl App {
             scale: Some(Scale::Chromatic),
             tonic: 0,
             a4: 440.0,
+            level_gate: -60.0,
+            show_pitch: true,
             harmonics: true,
-            peak_gate: -70.0,
         };
         app.switch_device(None);
         app
@@ -116,6 +145,10 @@ impl App {
 
     fn reset_analysis(&mut self) {
         self.stft = Stft::new(self.analysis.fft_size, self.analysis.hop);
+        self.yin = Yin::new(
+            pitch_window(self.analysis.fft_size, self.sample_rate),
+            self.sample_rate,
+        );
         self.waterfall = Waterfall::new(COLS, self.row_map());
         self.peak = None;
     }
@@ -149,7 +182,19 @@ impl App {
             return;
         }
         let wf = &mut self.waterfall;
-        self.stft.process(&self.samples, |spec| wf.push(spec));
+        let yin = &mut self.yin;
+        let gate = self.level_gate;
+        self.stft.process(&self.samples, |spec, frame| {
+            let n = yin.len();
+            let start = (frame.len() - n) / 2;
+            let x = &frame[start..start + n];
+            let pitch = if dsp::rms_db(x) >= gate {
+                yin.detect(x, PITCH_MIN, PITCH_MAX)
+            } else {
+                None
+            };
+            wf.push(spec, pitch);
+        });
         if let Some(latest) = self.waterfall.latest_raw() {
             self.peak = dsp::peak(latest, self.bin_hz(), self.axis.f_min, self.axis.f_max);
         }
@@ -164,7 +209,12 @@ impl App {
     }
 
     fn gated_peak(&self) -> Option<(f32, f32)> {
-        self.peak.filter(|&(_, db)| db >= self.peak_gate)
+        self.peak.filter(|&(_, db)| db >= self.level_gate)
+    }
+
+    fn note_text(&self, f: f32) -> String {
+        let (m, cents) = music::nearest_note(f, self.a4);
+        format!("{:<4} {:+4.0} 音分", music::note_name(m), cents)
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -173,7 +223,7 @@ impl App {
                 let mut chosen = None;
                 egui::ComboBox::from_label("")
                     .width(240.0)
-                    .selected_text(self.device.as_deref().unwrap_or("No input"))
+                    .selected_text(self.device.as_deref().unwrap_or("无输入设备"))
                     .show_ui(ui, |ui| {
                         for name in &self.devices {
                             if ui
@@ -184,7 +234,7 @@ impl App {
                             }
                         }
                     });
-                if ui.button("⟳").on_hover_text("Rescan devices").clicked() {
+                if ui.button("⟳").on_hover_text("重新扫描设备").clicked() {
                     self.devices = audio::input_device_names();
                 }
                 if chosen.is_some() && chosen != self.device {
@@ -192,37 +242,29 @@ impl App {
                 }
 
                 let label = if self.paused {
-                    "▶ Resume"
+                    "▶ 继续"
                 } else {
-                    "⏸ Pause"
+                    "⏸ 暂停"
                 };
                 if ui.button(label).clicked() {
                     self.paused = !self.paused;
                 }
                 ui.separator();
 
-                let readout = match self.gated_peak() {
-                    Some((f, db)) => {
-                        let (m, cents) = music::nearest_note(f, self.a4);
-                        format!(
-                            "{:<4} {:+4.0} ct  {:8.1} Hz  {:6.1} dB",
-                            music::note_name(m),
-                            cents,
-                            f,
-                            db
-                        )
-                    }
-                    None => "—".into(),
+                let latest = self.waterfall.pitch_at(self.waterfall.cols() - 1);
+                let readout = match latest {
+                    Some(f) => format!("音高 {}  {:7.1} Hz", self.note_text(f), f),
+                    None => "音高 —".into(),
                 };
-                ui.label(RichText::new(readout).monospace().size(18.0).color(AMBER));
+                ui.label(RichText::new(readout).monospace().size(18.0).color(GREEN));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(e) = &self.error {
                         ui.label(RichText::new(e).color(Color32::LIGHT_RED));
                     } else if self.paused {
-                        ui.label(RichText::new("PAUSED").color(Color32::LIGHT_RED).strong());
+                        ui.label(RichText::new("已暂停").color(Color32::LIGHT_RED).strong());
                     } else {
-                        ui.label(format!("{:.0} Hz", self.sample_rate));
+                        ui.label(format!("采样率 {:.0} Hz", self.sample_rate));
                     }
                 });
             });
@@ -235,8 +277,8 @@ impl App {
             .exact_width(240.0)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                ui.heading("Analysis");
-                egui::ComboBox::from_label("FFT size")
+                ui.heading("分析");
+                egui::ComboBox::from_label("FFT 点数")
                     .selected_text(self.analysis.fft_size.to_string())
                     .show_ui(ui, |ui| {
                         for n in FFT_SIZES {
@@ -245,7 +287,7 @@ impl App {
                     });
                 let fft_size = self.analysis.fft_size;
                 self.analysis.hop = self.analysis.hop.min(fft_size);
-                egui::ComboBox::from_label("Hop")
+                egui::ComboBox::from_label("帧移")
                     .selected_text(self.analysis.hop.to_string())
                     .show_ui(ui, |ui| {
                         for h in HOPS.into_iter().filter(|&h| h <= fft_size) {
@@ -255,51 +297,44 @@ impl App {
                 let dt = self.analysis.hop as f32 / self.sample_rate;
                 ui.label(
                     RichText::new(format!(
-                        "Δf {:.2} Hz  ·  Δt {:.1} ms\nwindow {:.0} ms  ·  history {:.1} s",
+                        "频率分辨率 {:.2} Hz · 帧移 {:.1} ms\n窗长 {:.0} ms · 历史 {:.1} 秒\n可测最低音高 ≈ {:.0} Hz",
                         self.bin_hz(),
                         dt * 1e3,
                         fft_size as f32 / self.sample_rate * 1e3,
-                        dt * COLS as f32
+                        dt * COLS as f32,
+                        self.yin.lowest_freq().max(PITCH_MIN),
                     ))
                     .small()
                     .weak(),
                 );
 
                 ui.separator();
-                ui.heading("Display");
+                ui.heading("显示");
                 let nyquist = self.sample_rate / 2.0;
                 ui.add(
                     Slider::new(&mut self.axis.f_min, 20.0..=2_000.0)
                         .logarithmic(true)
                         .suffix(" Hz")
-                        .text("f min"),
+                        .text("最低频率"),
                 );
                 ui.add(
                     Slider::new(&mut self.axis.f_max, 200.0..=nyquist)
                         .logarithmic(true)
                         .suffix(" Hz")
-                        .text("f max"),
+                        .text("最高频率"),
                 );
                 // 至少留一个八度
                 if self.axis.f_max < self.axis.f_min * 2.0 {
                     self.axis.f_max = (self.axis.f_min * 2.0).min(nyquist);
                     self.axis.f_min = self.axis.f_min.min(self.axis.f_max / 2.0);
                 }
-                ui.add(
-                    Slider::new(&mut self.db_hi, -80.0..=0.0)
-                        .suffix(" dB")
-                        .text("top"),
-                );
-                ui.add(
-                    Slider::new(&mut self.db_lo, -140.0..=-20.0)
-                        .suffix(" dB")
-                        .text("floor"),
-                );
+                ui.add(Slider::new(&mut self.db_hi, -80.0..=0.0).suffix(" dB").text("亮度上限"));
+                ui.add(Slider::new(&mut self.db_lo, -140.0..=-20.0).suffix(" dB").text("亮度下限"));
                 if self.db_hi < self.db_lo + 10.0 {
                     self.db_lo = self.db_hi - 10.0;
                 }
                 let before = self.colormap;
-                egui::ComboBox::from_label("Colormap")
+                egui::ComboBox::from_label("色表")
                     .selected_text(self.colormap.name())
                     .show_ui(ui, |ui| {
                         for c in Colormap::ALL {
@@ -311,16 +346,23 @@ impl App {
                 }
 
                 ui.separator();
-                ui.heading("Notes");
-                egui::ComboBox::from_label("Scale")
-                    .selected_text(self.scale.map_or("Off", Scale::name))
+                ui.heading("音高与音阶");
+                ui.add(
+                    Slider::new(&mut self.level_gate, -120.0..=0.0)
+                        .suffix(" dB")
+                        .text("电平门限"),
+                )
+                .on_hover_text("低于此电平不测音高、不标峰值");
+                ui.checkbox(&mut self.show_pitch, "显示音高轨迹");
+                egui::ComboBox::from_label("音阶")
+                    .selected_text(self.scale.map_or("关", Scale::name))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.scale, None, "Off");
+                        ui.selectable_value(&mut self.scale, None, "关");
                         for s in Scale::ALL {
                             ui.selectable_value(&mut self.scale, Some(s), s.name());
                         }
                     });
-                egui::ComboBox::from_label("Tonic")
+                egui::ComboBox::from_label("主音")
                     .selected_text(NOTE_NAMES[self.tonic as usize])
                     .show_ui(ui, |ui| {
                         for (i, n) in NOTE_NAMES.iter().enumerate() {
@@ -331,17 +373,12 @@ impl App {
                     Slider::new(&mut self.a4, 400.0..=480.0)
                         .step_by(0.5)
                         .suffix(" Hz")
-                        .text("A4"),
+                        .text("A4 基准"),
                 );
-                ui.add(
-                    Slider::new(&mut self.peak_gate, -120.0..=0.0)
-                        .suffix(" dB")
-                        .text("peak gate"),
-                );
-                ui.checkbox(&mut self.harmonics, "Harmonics on hover");
+                ui.checkbox(&mut self.harmonics, "悬停时显示泛音");
 
                 ui.separator();
-                ui.label(RichText::new("Space  pause / resume").small().weak());
+                ui.label(RichText::new("空格  暂停 / 继续").small().weak());
             });
     }
 
@@ -380,6 +417,9 @@ impl App {
 
                 self.draw_freq_ticks(&painter, spec);
                 self.draw_scale(&painter, spec);
+                if self.show_pitch {
+                    self.draw_pitch(&painter, spec);
+                }
                 self.draw_live(&painter, live);
                 if let Some(p) = resp.hover_pos().filter(|p| spec.contains(*p)) {
                     self.draw_hover(&painter, spec, p);
@@ -452,6 +492,28 @@ impl App {
         }
     }
 
+    fn draw_pitch(&self, painter: &Painter, spec: Rect) {
+        let cols = self.waterfall.cols();
+        let mut track: Vec<Pos2> = Vec::new();
+        let mut prev: Option<f32> = None;
+        for x in 0..cols {
+            let f = self
+                .waterfall
+                .pitch_at(x)
+                .filter(|f| (self.axis.f_min..=self.axis.f_max).contains(f));
+            let jump = matches!((prev, f), (Some(a), Some(b)) if 12.0 * (b / a).log2().abs() > MAX_TRACK_JUMP);
+            if f.is_none() || jump {
+                stroke_track(painter, &mut track);
+            }
+            if let Some(f) = f {
+                let px = spec.left() + (x as f32 + 0.5) / cols as f32 * spec.width();
+                track.push(pos2(px, self.freq_y(spec, f)));
+            }
+            prev = f;
+        }
+        stroke_track(painter, &mut track);
+    }
+
     fn draw_live(&self, painter: &Painter, live: Rect) {
         painter.rect_filled(live, 2.0, Color32::from_gray(20));
         let col = self.waterfall.mapped_column(self.waterfall.cols() - 1);
@@ -470,11 +532,19 @@ impl App {
             .collect();
         painter.add(Shape::line(points, Stroke::new(1.0, CYAN)));
 
+        // 琥珀：最强频率；绿：音高。泛音比基音响时两者会差一个或几个八度
         if let Some((f, _)) = self.gated_peak() {
             let y = self.freq_y(live, f);
             painter.line_segment(
                 [pos2(live.left(), y), pos2(live.right(), y)],
                 Stroke::new(1.0, AMBER),
+            );
+        }
+        if let Some(f) = self.waterfall.pitch_at(self.waterfall.cols() - 1) {
+            let y = self.freq_y(live, f);
+            painter.line_segment(
+                [pos2(live.left(), y), pos2(live.right(), y)],
+                Stroke::new(1.5, GREEN),
             );
         }
     }
@@ -515,11 +585,13 @@ impl App {
         let r = (((p.y - spec.top()) / spec.height() * rows as f32) as usize).min(rows - 1);
         let db = self.waterfall.mapped_column(x)[r];
         let age = (cols - 1 - x) as f32 * self.analysis.hop as f32 / self.sample_rate;
-        let (m, cents) = music::nearest_note(f, self.a4);
+        let pitch = match self.waterfall.pitch_at(x) {
+            Some(pf) => format!("音高 {}", self.note_text(pf)),
+            None => "音高 —".into(),
+        };
         let text = format!(
-            "{f:8.1} Hz\n{:<4} {cents:+4.0} ct\n{db:8.1} dB\n{:>8.2} s ago",
-            music::note_name(m),
-            age
+            "{f:8.1} Hz\n{}\n{db:8.1} dB\n{age:8.2} 秒前\n{pitch}",
+            self.note_text(f)
         );
 
         let galley = painter.layout_no_wrap(text, FontId::monospace(12.0), Color32::WHITE);
@@ -538,6 +610,24 @@ impl App {
         );
         painter.galley(pos, galley, Color32::WHITE);
     }
+}
+
+/// 画一段音高轨迹（深色描边打底，任何色表上都看得清），然后清空。
+fn stroke_track(painter: &Painter, track: &mut Vec<Pos2>) {
+    match track.len() {
+        0 => {}
+        1 => {
+            painter.circle_filled(track[0], 1.5, GREEN);
+        }
+        _ => {
+            painter.add(Shape::line(
+                track.clone(),
+                Stroke::new(4.0, Color32::from_black_alpha(160)),
+            ));
+            painter.add(Shape::line(track.clone(), Stroke::new(2.0, GREEN)));
+        }
+    }
+    track.clear();
 }
 
 impl eframe::App for App {

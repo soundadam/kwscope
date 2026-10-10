@@ -62,6 +62,7 @@ pub struct Waterfall {
     map: RowMap,
     raw: Vec<f32>,
     mapped: Vec<f32>,
+    pitch: Vec<Option<f32>>,
     head: usize,
     pushed: usize,
 }
@@ -71,6 +72,7 @@ impl Waterfall {
         Self {
             cols,
             raw: vec![DB_FLOOR; cols * map.bins],
+            pitch: vec![None; cols],
             mapped: vec![DB_FLOOR; cols * map.rows()],
             map,
             head: 0,
@@ -86,12 +88,13 @@ impl Waterfall {
         self.map.rows()
     }
 
-    pub fn push(&mut self, spectrum: &[f32]) {
+    pub fn push(&mut self, spectrum: &[f32], pitch: Option<f32>) {
         let (b, r) = (self.map.bins, self.map.rows());
         let c = self.head;
         self.raw[c * b..(c + 1) * b].copy_from_slice(spectrum);
         self.map
             .apply(spectrum, &mut self.mapped[c * r..(c + 1) * r]);
+        self.pitch[c] = pitch;
         self.head = (self.head + 1) % self.cols;
         self.pushed += 1;
     }
@@ -118,6 +121,11 @@ impl Waterfall {
         let c = (self.head + x) % self.cols;
         let r = self.map.rows();
         &self.mapped[c * r..(c + 1) * r]
+    }
+
+    /// 与 `mapped_column` 同一列序。
+    pub fn pitch_at(&self, x: usize) -> Option<f32> {
+        self.pitch[(self.head + x) % self.cols]
     }
 
     pub fn latest_raw(&self) -> Option<&[f32]> {
