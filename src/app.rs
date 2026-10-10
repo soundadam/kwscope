@@ -676,7 +676,7 @@ impl App {
     }
 
     fn draw_freq_ticks(&self, painter: &Painter, spec: Rect) {
-        let stroke = Stroke::new(1.0, Color32::from_gray(140));
+        let stroke = Stroke::new(1.0_f32, Color32::from_gray(140));
         for f in FREQ_TICKS {
             if f < self.axis.f_min || f > self.axis.f_max {
                 continue;
@@ -713,7 +713,7 @@ impl App {
             };
             painter.line_segment(
                 [pos2(spec.left(), y), pos2(spec.right(), y)],
-                Stroke::new(1.0, color),
+                Stroke::new(1.0_f32, color),
             );
         }
         // 主音标签优先占位，其余音名在不挤的地方补上
@@ -778,33 +778,33 @@ impl App {
                 )
             })
             .collect();
-        painter.add(Shape::line(points, Stroke::new(1.0, CYAN)));
+        painter.add(Shape::line(points, Stroke::new(1.0_f32, CYAN)));
 
         // 琥珀：最强频率；绿：音高。泛音比基音响时两者会差一个或几个八度
         if let Some((f, _)) = self.gated_peak() {
             let y = self.freq_y(live, f);
             painter.line_segment(
                 [pos2(live.left(), y), pos2(live.right(), y)],
-                Stroke::new(1.0, AMBER),
+                Stroke::new(1.0_f32, AMBER),
             );
         }
         if let Some(f) = self.waterfall.pitch_at(self.waterfall.cols() - 1) {
             let y = self.freq_y(live, f);
             painter.line_segment(
                 [pos2(live.left(), y), pos2(live.right(), y)],
-                Stroke::new(1.5, GREEN),
+                Stroke::new(1.5_f32, GREEN),
             );
         }
     }
 
     fn draw_hover(&self, painter: &Painter, spec: Rect, p: Pos2) {
         let f = self.y_freq(spec, p.y);
-        let cross = Stroke::new(1.0, Color32::from_white_alpha(70));
+        let cross = Stroke::new(1.0_f32, Color32::from_white_alpha(70));
         painter.line_segment([pos2(spec.left(), p.y), pos2(spec.right(), p.y)], cross);
         painter.line_segment([pos2(p.x, spec.top()), pos2(p.x, spec.bottom())], cross);
 
         if self.harmonics {
-            let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 140, 60, 150));
+            let stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 140, 60, 150));
             for k in 2..=MAX_HARMONIC {
                 let fk = f * k as f32;
                 if fk > self.axis.f_max {
@@ -870,9 +870,9 @@ fn stroke_track(painter: &Painter, track: &mut Vec<Pos2>) {
         _ => {
             painter.add(Shape::line(
                 track.clone(),
-                Stroke::new(4.0, Color32::from_black_alpha(160)),
+                Stroke::new(4.0_f32, Color32::from_black_alpha(160)),
             ));
-            painter.add(Shape::line(track.clone(), Stroke::new(2.0, GREEN)));
+            painter.add(Shape::line(track.clone(), Stroke::new(2.0_f32, GREEN)));
         }
     }
     track.clear();
