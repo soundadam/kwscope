@@ -6,6 +6,9 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
+/// 环形缓冲能存的音频时长：UI 卡顿或低帧率时不丢样本；真满了丢新样本而不是阻塞音频线程。
+pub const RING_SECONDS: f32 = 2.0;
+
 /// 回调线程写、UI 线程读的计数，只用原子量，不让音频线程碰锁。
 #[derive(Default)]
 pub struct Stats {
@@ -67,8 +70,7 @@ pub fn open(name: Option<&str>) -> Result<Input, String> {
     let format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
 
-    // 两秒余量：UI 卡顿时不丢样本；真满了丢新样本而不是阻塞音频线程
-    let (producer, consumer) = RingBuffer::new(sample_rate as usize * 2);
+    let (producer, consumer) = RingBuffer::new((sample_rate as f32 * RING_SECONDS) as usize);
     let stats = Arc::new(Stats::default());
     let s = stats.clone();
     let stream = match format {

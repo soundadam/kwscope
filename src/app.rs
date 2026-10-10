@@ -3,14 +3,14 @@ use crate::axis::LogAxis;
 use crate::colormap::Colormap;
 use crate::dsp::{self, Stft};
 use crate::music::{self, Scale, NOTE_NAMES};
-use crate::perf::{Latency, Perf};
+use crate::perf::{Latency, Pace, Perf};
 use crate::pitch::Yin;
 use crate::waterfall::{RowMap, Waterfall};
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Shape, Slider,
     Stroke, TextureHandle, TextureOptions,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // 纹理分辨率与窗口无关，GPU 线性缩放到绘制区域
 const ROWS: usize = 600;
@@ -31,6 +31,11 @@ const PITCH_MAX: f32 = 2_000.0;
 const MAX_TRACK_JUMP: f32 = 2.0;
 
 const COPYRIGHT_YEAR: u32 = 2026;
+/// 帧率上限选项；`None` 跟显示器刷新率。
+const FRAME_RATES: [Option<u32>; 3] = [None, Some(60), Some(30)];
+/// 电平持续低于门限这么久算没声音，帧率降到 `QUIET_FPS`。
+const QUIET_HOLD: Duration = Duration::from_millis(500);
+const QUIET_FPS: f32 = 15.0;
 
 const HZ_GUTTER: f32 = 44.0;
 const NOTE_GUTTER: f32 = 44.0;
@@ -64,6 +69,10 @@ pub struct App {
     peak: Option<(f32, f32)>,
     paused: bool,
     perf: Perf,
+    max_fps: Option<u32>,
+    /// 最近一次有帧电平达到门限的时刻。
+    last_loud: Option<Instant>,
+    pace: Pace,
 
     axis: LogAxis,
     db_lo: f32,
@@ -124,6 +133,10 @@ impl App {
             peak: None,
             paused: false,
             perf: Perf::default(),
+            max_fps: None,
+            // 启动后先按刷新率跑一小会儿，量出显示器刷新率
+            last_loud: Some(Instant::now()),
+            pace: Pace::Vsync,
             axis,
             db_lo: -100.0,
             db_hi: -20.0,
@@ -134,7 +147,8 @@ impl App {
             scale: Some(Scale::Chromatic),
             tonic: 0,
             a4: 440.0,
-            level_gate: -60.0,
+            // 笔记本内置麦克风的环境底噪约 −50 dB，门限放在它上面
+            level_gate: -45.0,
             show_pitch: true,
             harmonics: true,
         };
@@ -195,6 +209,7 @@ impl App {
         let yin = &mut self.yin;
         let gate = self.level_gate;
         let mut cols = 0;
+        let mut loud = false;
         let t0 = Instant::now();
         self.stft.process(&self.samples, |spec, frame| {
             cols += 1;
@@ -202,6 +217,7 @@ impl App {
             let start = (frame.len() - n) / 2;
             let x = &frame[start..start + n];
             let pitch = if dsp::rms_db(x) >= gate {
+                loud = true;
                 yin.detect(x, PITCH_MIN, PITCH_MAX)
             } else {
                 None
@@ -210,6 +226,9 @@ impl App {
         });
         self.perf.dsp.add(t0.elapsed().as_secs_f32());
         self.perf.cols.add(cols as f32);
+        if loud {
+            self.last_loud = Some(Instant::now());
+        }
         self.perf.unframed.add(self.stft.unframed() as f32);
         if let Some(latest) = self.waterfall.latest_raw() {
             self.peak = dsp::peak(latest, self.bin_hz(), self.axis.f_min, self.axis.f_max);
@@ -388,6 +407,26 @@ impl App {
         if self.colormap != before {
             self.lut = self.colormap.lut();
         }
+        let vsync = self.perf.vsync.value();
+        let rate_name = |r: Option<u32>| match (r, vsync) {
+            (Some(fps), _) => format!("{fps} fps"),
+            (None, Some(dt)) => format!("Display ({:.0} Hz)", 1.0 / dt),
+            (None, None) => "Display".into(),
+        };
+        egui::ComboBox::from_label("Frame rate")
+            .selected_text(rate_name(self.max_fps))
+            .show_ui(ui, |ui| {
+                for r in FRAME_RATES {
+                    ui.selectable_value(&mut self.max_fps, r, rate_name(r));
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "Display follows the monitor refresh rate (measured). \
+                 Input below the level gate for {:.1} s drops to {QUIET_FPS:.0} fps; \
+                 while paused the view redraws only on mouse or keyboard input",
+                QUIET_HOLD.as_secs_f32()
+            ));
 
         ui.separator();
         ui.heading("Pitch & scale");
@@ -396,7 +435,10 @@ impl App {
                 .suffix(" dB")
                 .text("level gate"),
         )
-        .on_hover_text("Frames below this level get no pitch and no peak marker");
+        .on_hover_text(
+            "Frames below this level get no pitch and no peak marker; \
+             a quiet input also lowers the frame rate (see Frame rate)",
+        );
         ui.checkbox(&mut self.show_pitch, "Pitch track");
         egui::ComboBox::from_label("Scale")
             .selected_text(self.scale.map_or("Off", Scale::name))
@@ -426,6 +468,23 @@ impl App {
 
         ui.separator();
         ui.label(RichText::new("Space  pause / resume").small().weak());
+    }
+
+    /// 没有输入时只跟界面事件；暂停时只需按时取走样本，让环形缓冲不溢出；
+    /// 电平持续低于门限时降帧；其余按帧率上限。
+    fn pace(&self) -> Pace {
+        if self.input.is_none() {
+            return Pace::Events;
+        }
+        if self.paused {
+            return Pace::Fps(4.0 / audio::RING_SECONDS);
+        }
+        let quiet = self.last_loud.is_none_or(|t| t.elapsed() > QUIET_HOLD);
+        match (quiet, self.max_fps.map(|f| f as f32)) {
+            (true, cap) => Pace::Fps(cap.map_or(QUIET_FPS, |c| c.min(QUIET_FPS))),
+            (false, Some(cap)) => Pace::Fps(cap),
+            (false, None) => Pace::Vsync,
+        }
     }
 
     fn latency(&self) -> Latency {
@@ -821,7 +880,9 @@ fn stroke_track(painter: &Painter, track: &mut Vec<Pos2>) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.perf.tick(frame.info().cpu_usage);
+        let start = Instant::now();
+        self.perf
+            .tick(frame.info().cpu_usage, self.pace == Pace::Vsync);
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.paused = !self.paused;
         }
@@ -837,6 +898,15 @@ impl eframe::App for App {
         }
 
         self.central(ctx);
-        ctx.request_repaint();
+        self.pace = self.pace();
+        match self.pace {
+            Pace::Vsync => ctx.request_repaint(),
+            Pace::Fps(fps) => {
+                // egui 会先从延迟里减去 predicted_dt（eframe 不更新它，恒为 1/60 s），加回去
+                let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt));
+                ctx.request_repaint_after(self.perf.delay(fps, start.elapsed()) + predicted);
+            }
+            Pace::Events => {}
+        }
     }
 }
