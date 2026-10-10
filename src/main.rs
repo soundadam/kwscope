@@ -16,9 +16,7 @@ mod waterfall;
 // release 版没有控制台，不回退的话程序会一声不响地退出。
 fn main() -> eframe::Result {
     let app = appkit::app!("Tonescope");
-    if let Some(code) = appkit::cli::run(&app) {
-        std::process::exit(code);
-    }
+    let appkit::cli::NoArgs {} = appkit::cli::parse(&app);
     let run = |renderer| {
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
