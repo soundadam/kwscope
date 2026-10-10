@@ -15,6 +15,10 @@ mod waterfall;
 // 这时改用 wgpu（Windows 上走 D3D12，没有 GPU 时还有 WARP 软件渲染）。
 // release 版没有控制台，不回退的话程序会一声不响地退出。
 fn main() -> eframe::Result {
+    let app = appkit::app!("Tonescope");
+    if let Some(code) = appkit::cli::run(&app) {
+        std::process::exit(code);
+    }
     let run = |renderer| {
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
@@ -30,9 +34,9 @@ fn main() -> eframe::Result {
             ..Default::default()
         };
         eframe::run_native(
-            "Tonescope",
+            app.display_name,
             options,
-            Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+            Box::new(move |cc| Ok(Box::new(app::App::new(cc, app)))),
         )
     };
     run(eframe::Renderer::Glow).or_else(|e| {

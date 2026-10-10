@@ -6,7 +6,7 @@ presentation:
   category: 声学 / macOS + Linux + Windows
   label: 用 Homebrew 安装
   command: brew install --cask soundadam/tap/tonescope
-  note: 单个可执行文件。不要账号。不联网。
+  note: 单个可执行文件。不要账号。从 GitHub Releases 自动更新。
 registry:
   github: soundadam/tonescope
   homebrew: soundadam/tap/tonescope

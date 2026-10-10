@@ -21,6 +21,17 @@ Windows 从 [Releases](https://github.com/soundadam/tonescope/releases) 下载 z
   从 Releases 下载 zip 的，路径换成解压出来的 `Tonescope.app`。首次运行会请求麦克风权限。
 - Linux：需要系统里有 ALSA（`libasound2`）；PulseAudio / PipeWire 通过 ALSA 兼容层接入。
 
+## 命令行与更新
+
+```bash
+tonescope                  # 打开界面
+tonescope update           # 更新到最新版
+tonescope update --check   # 只看有没有新版
+tonescope --version
+```
+
+Homebrew 装的升级交给 brew，从 Releases 下载的 `.app` 或可执行文件原地替换自己。界面每天至多查一次新版，有新版时顶栏右侧出现 Update 按钮；设置里的 Updates 一节可以关掉自动检查。怎么判断安装方式、会发哪些网络请求见 [appkit](https://github.com/soundadam/appkit#更新)。
+
 ## 从源码运行
 
 ```bash
@@ -41,7 +52,7 @@ scripts/package.sh
 
 ## 发布
 
-推 `v*` tag（必须与 `Cargo.toml` 的版本一致），[release workflow](.github/workflows/release.yml) 构建 macOS（通用二进制 `.app`）、Windows（x86_64）、Linux（x86_64）三份产物发到 Releases，再用 [`packaging/homebrew/tonescope.rb`](packaging/homebrew/tonescope.rb) 填好版本与 SHA-256 推到 [soundadam/homebrew-tap](https://github.com/soundadam/homebrew-tap)。带 `-` 的预发布 tag 不更新 Cask。
+产物命名、Cask 与命令行照 [appkit](https://github.com/soundadam/appkit) 的约定。推 `v*` tag（必须与 `Cargo.toml` 的版本一致），[release workflow](.github/workflows/release.yml) 构建 macOS（通用二进制 `.app`）、Windows（x86_64）、Linux（x86_64）三份产物发到 Releases，再用 [`packaging/homebrew/tonescope.rb`](packaging/homebrew/tonescope.rb) 填好版本与 SHA-256 推到 [soundadam/homebrew-tap](https://github.com/soundadam/homebrew-tap)。带 `-` 的预发布 tag 不更新 Cask。
 
 [`site/`](site/) 是 [soundadam.com/projects/tonescope](https://soundadam.com/projects/tonescope/) 的文案与截图，站点以 Hugo module 引入；main 上 `site/` 一变，[site workflow](.github/workflows/site.yml) 就通知站点重新发布。
 
