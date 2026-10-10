@@ -22,10 +22,11 @@ Darwin)
     done
     stage=$(mktemp -d)
     app="$stage/Tonescope.app"
-    mkdir -p "$app/Contents/MacOS"
+    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     lipo -create -output "$app/Contents/MacOS/tonescope" \
         "$target_dir"/{aarch64,x86_64}-apple-darwin/release/tonescope
     sed "s/@VERSION@/$version/g" packaging/macos/Info.plist >"$app/Contents/Info.plist"
+    cp packaging/icon/tonescope.icns "$app/Contents/Resources/"
     # 没有开发者证书时只能 ad-hoc；Apple Silicon 不接受未签名的 bundle
     codesign --force --sign - "$app"
     cp "${extras[@]}" "$stage/"
