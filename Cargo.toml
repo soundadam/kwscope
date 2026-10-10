@@ -1,6 +1,6 @@
 [package]
 name = "tonescope"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["soundadam"]
 repository = "https://github.com/soundadam/tonescope"
@@ -20,3 +20,7 @@ codegen-units = 1
 # 依赖开优化：debug 构建下 FFT 和绘制也能跑满帧率
 [profile.dev.package."*"]
 opt-level = 2
+
+# exe 的图标资源只在 Windows 上编进去（build.rs）
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

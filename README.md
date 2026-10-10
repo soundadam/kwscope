@@ -12,7 +12,13 @@ brew install --cask soundadam/tap/tonescope
 
 Windows 从 [Releases](https://github.com/soundadam/tonescope/releases) 下载 zip。
 
-- macOS：`.app` 只有 ad-hoc 签名、未公证，首次打开会被拦下，到「系统设置 → 隐私与安全性」里点「仍要打开」。首次运行会请求麦克风权限。
+- macOS：`.app` 只有 ad-hoc 签名、未公证，首次打开会被拦下。到「系统设置 → 隐私与安全性」里点「仍要打开」，或者自己去掉隔离属性：
+
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/Tonescope.app
+  ```
+
+  从 Releases 下载 zip 的，路径换成解压出来的 `Tonescope.app`。首次运行会请求麦克风权限。
 - Linux：需要系统里有 ALSA（`libasound2`）；PulseAudio / PipeWire 通过 ALSA 兼容层接入。
 
 ## 从源码运行
