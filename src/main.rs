@@ -3,7 +3,9 @@ mod audio;
 mod axis;
 mod colormap;
 mod dsp;
+mod fonts;
 mod music;
+mod pitch;
 mod waterfall;
 
 fn main() -> eframe::Result {

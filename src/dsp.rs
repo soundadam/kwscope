@@ -48,8 +48,9 @@ impl Stft {
         self.size / 2 + 1
     }
 
-    /// 喂入任意长度的样本；每凑满一帧回调一次 dB 谱（长度 `bins()`）。
-    pub fn process(&mut self, samples: &[f32], mut on_frame: impl FnMut(&[f32])) {
+    /// 喂入任意长度的样本；每凑满一帧回调一次 `(dB 谱, 该帧未加窗的原始样本)`，
+    /// 谱长度 `bins()`，样本长度为 FFT 大小。
+    pub fn process(&mut self, samples: &[f32], mut on_frame: impl FnMut(&[f32], &[f32])) {
         self.pending.extend_from_slice(samples);
         let mut start = 0;
         while self.pending.len() - start >= self.size {
@@ -63,11 +64,17 @@ impl Stft {
             for (o, c) in self.out.iter_mut().zip(&self.spectrum) {
                 *o = 20.0 * (c.norm() * self.norm).max(1e-8).log10();
             }
-            on_frame(&self.out);
+            on_frame(&self.out, src);
             start += self.hop;
         }
         self.pending.drain(..start);
     }
+}
+
+/// 均方根电平（dBFS，满幅正弦 ≈ −3 dB）。
+pub fn rms_db(x: &[f32]) -> f32 {
+    let ms = x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32;
+    10.0 * ms.max(1e-16).log10()
 }
 
 /// 在 `[f_lo, f_hi]` 内找最强 bin，对 dB 做抛物线插值，返回 `(频率 Hz, dB)`。
@@ -109,7 +116,7 @@ mod tests {
     fn first_frame(signal: &[f32]) -> Vec<f32> {
         let mut stft = Stft::new(N, N);
         let mut out = None;
-        stft.process(signal, |s| out = out.take().or_else(|| Some(s.to_vec())));
+        stft.process(signal, |s, _| out = out.take().or_else(|| Some(s.to_vec())));
         out.expect("signal holds at least one frame")
     }
 
@@ -146,7 +153,7 @@ mod tests {
             let mut stft = Stft::new(1024, 256);
             let mut frames = Vec::new();
             for c in signal.chunks(chunk) {
-                stft.process(c, |s| frames.push(s.to_vec()));
+                stft.process(c, |s, _| frames.push(s.to_vec()));
             }
             frames
         };

@@ -27,10 +27,8 @@ pub fn open(name: Option<&str>) -> Result<Input, String> {
             .input_devices()
             .map_err(|e| e.to_string())?
             .find(|d| d.name().is_ok_and(|x| x == n))
-            .ok_or_else(|| format!("input device not found: {n}"))?,
-        None => host
-            .default_input_device()
-            .ok_or("no default input device")?,
+            .ok_or_else(|| format!("找不到输入设备：{n}"))?,
+        None => host.default_input_device().ok_or("没有默认输入设备")?,
     };
     let device_name = device.name().unwrap_or_else(|_| "?".into());
     let supported = device.default_input_config().map_err(|e| e.to_string())?;
@@ -46,7 +44,7 @@ pub fn open(name: Option<&str>) -> Result<Input, String> {
         cpal::SampleFormat::I16 => build::<i16>(&device, &config, channels, producer),
         cpal::SampleFormat::U16 => build::<u16>(&device, &config, channels, producer),
         cpal::SampleFormat::I32 => build::<i32>(&device, &config, channels, producer),
-        other => return Err(format!("unsupported sample format: {other:?}")),
+        other => return Err(format!("不支持的采样格式：{other:?}")),
     }
     .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
