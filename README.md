@@ -35,3 +35,7 @@ macOS 首次运行会请求麦克风权限，权限记在启动它的那个程�
 - [ ] 非十二平均律：纯律、五度相生律、自定义 cents 表
 - [ ] 打包 macOS `.app`（含 `NSMicrophoneUsageDescription`）与 Windows / Linux 发布产物
 - [ ] 可选 CQT / 重分配谱，提升低频分辨率
+
+## 许可证
+
+[MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE)，任选其一。
