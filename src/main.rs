@@ -3,8 +3,8 @@ mod audio;
 mod axis;
 mod colormap;
 mod dsp;
-mod fonts;
 mod music;
+mod perf;
 mod pitch;
 mod waterfall;
 

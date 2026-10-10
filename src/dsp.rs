@@ -48,6 +48,12 @@ impl Stft {
         self.size / 2 + 1
     }
 
+    /// 最新一帧末尾之后、还没进入任何一帧的样本数。缓冲里另有 `size - hop`
+    /// 个样本与最新一帧重叠，它们已经算在那一列里。
+    pub fn unframed(&self) -> usize {
+        self.pending.len().saturating_sub(self.size - self.hop)
+    }
+
     /// 喂入任意长度的样本；每凑满一帧回调一次 `(dB 谱, 该帧未加窗的原始样本)`，
     /// 谱长度 `bins()`，样本长度为 FFT 大小。
     pub fn process(&mut self, samples: &[f32], mut on_frame: impl FnMut(&[f32], &[f32])) {
@@ -158,6 +164,10 @@ mod tests {
             frames
         };
         let whole = run(signal.len());
+        let mut stft = Stft::new(1024, 256);
+        stft.process(&signal, |_, _| {});
+        let framed_end = (whole.len() - 1) * 256 + 1024;
+        assert_eq!(stft.unframed(), signal.len() - framed_end);
         assert_eq!(whole.len(), (signal.len() - 1024) / 256 + 1);
         assert_eq!(whole, run(37));
     }

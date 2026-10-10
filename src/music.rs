@@ -65,19 +65,19 @@ impl Scale {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::Chromatic => "半音阶",
-            Self::Major => "大调",
-            Self::NaturalMinor => "自然小调",
-            Self::HarmonicMinor => "和声小调",
-            Self::MelodicMinor => "旋律小调",
-            Self::Dorian => "多利亚",
-            Self::Phrygian => "弗里几亚",
-            Self::Lydian => "利底亚",
-            Self::Mixolydian => "混合利底亚",
-            Self::MajorPentatonic => "大调五声",
-            Self::MinorPentatonic => "小调五声",
-            Self::Blues => "布鲁斯",
-            Self::WholeTone => "全音阶",
+            Self::Chromatic => "Chromatic",
+            Self::Major => "Major",
+            Self::NaturalMinor => "Natural minor",
+            Self::HarmonicMinor => "Harmonic minor",
+            Self::MelodicMinor => "Melodic minor",
+            Self::Dorian => "Dorian",
+            Self::Phrygian => "Phrygian",
+            Self::Lydian => "Lydian",
+            Self::Mixolydian => "Mixolydian",
+            Self::MajorPentatonic => "Major pentatonic",
+            Self::MinorPentatonic => "Minor pentatonic",
+            Self::Blues => "Blues",
+            Self::WholeTone => "Whole tone",
         }
     }
 

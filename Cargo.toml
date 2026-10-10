@@ -2,6 +2,8 @@
 name = "tonescope"
 version = "0.1.0"
 edition = "2021"
+authors = ["soundadam"]
+repository = "https://github.com/soundadam/tonescope"
 description = "Real-time log-frequency spectrogram with musical scale overlays"
 
 [dependencies]
