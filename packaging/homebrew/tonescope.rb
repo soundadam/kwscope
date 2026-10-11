@@ -12,16 +12,12 @@ cask "tonescope" do
     app "Tonescope.app"
     binary "#{appdir}/Tonescope.app/Contents/MacOS/tonescope"
 
-    caveats <<~EOS
-      Tonescope.app is ad-hoc signed and not notarized. Homebrew preserves
-      quarantine and this cask does not change Gatekeeper, so macOS blocks
-      the first launch. Either allow it under System Settings → Privacy &
-      Security → Open Anyway, or remove quarantine yourself:
+    # ad-hoc 签名、未公证：去掉隔离属性，与自更新换上的文件一样不被 Gatekeeper 拦下
+    postflight_steps do
+      run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/Tonescope.app"]
+    end
 
-        xattr -dr com.apple.quarantine "#{appdir}/Tonescope.app"
-
-      macOS asks for microphone access the first time it runs.
-    EOS
+    caveats "macOS asks for microphone access the first time Tonescope runs."
   end
   on_linux do
     on_intel do
