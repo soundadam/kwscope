@@ -25,9 +25,10 @@ Windows 从 [Releases](https://github.com/soundadam/tonescope/releases) 下载 z
 ## 命令行与更新
 
 ```bash
-tonescope                  # 打开界面
-tonescope update           # 更新到最新版
-tonescope update --check   # 只看有没有新版
+tonescope                         # 打开界面
+tonescope update                  # 更新到最新版
+tonescope update --check          # 只看有没有新版
+tonescope update --auto on|off    # 打开或关掉自动检查
 tonescope --version
 ```
 
