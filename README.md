@@ -7,6 +7,7 @@
 macOS 与 Linux（x86_64）用 Homebrew：
 
 ```bash
+brew trust --tap soundadam/tap
 brew install --cask soundadam/tap/tonescope
 ```
 

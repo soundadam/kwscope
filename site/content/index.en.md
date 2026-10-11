@@ -5,7 +5,9 @@ weight: 40
 presentation:
   category: Acoustics / macOS + Linux + Windows
   label: Install with Homebrew
-  command: brew install --cask soundadam/tap/tonescope
+  command:
+    - brew trust --tap soundadam/tap
+    - brew install --cask soundadam/tap/tonescope
   note: One executable. No account. Updates itself from GitHub Releases.
 registry:
   github: soundadam/tonescope
