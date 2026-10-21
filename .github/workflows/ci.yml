@@ -9,8 +9,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # 只改了 site/ 或 Markdown 就不跑三平台测试。不能用 paths-ignore：
+  # 那样整个 workflow 不触发，必过检查 `check` 永远等不到结果。
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - "**"
+              - "!site/**"
+              - "!**/*.md"
+
   test:
     name: test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -33,9 +55,13 @@ jobs:
 
   # ruleset 的必过检查名是 `check`；矩阵 job 的名字带平台后缀，由这里汇总。
   # 上游失败时被跳过的 job 会被当成通过，所以要 always() 后显式看结果。
+  # 只改文案时 test 被跳过，也算通过。
   check:
-    needs: test
+    needs: [changes, test]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: test "${{ needs.test.result }}" = success
+      - run: |
+          test "${{ needs.changes.result }}" = success
+          test "${{ needs.test.result }}" = success ||
+            { test "${{ needs.test.result }}" = skipped && test "${{ needs.changes.outputs.code }}" = false; }
