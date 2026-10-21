@@ -50,6 +50,8 @@ struct Timeline {
     /// `probs` 第一帧是开机以来第几帧。
     first_frame: usize,
     triggers: Vec<Trigger>,
+    /// 直播暂停又继续处的样本号：停着的那段剪掉了，前后拼在一起。
+    splices: Vec<usize>,
 }
 
 impl Timeline {
@@ -64,6 +66,7 @@ impl Timeline {
             probs: vec![],
             first_frame: 0,
             triggers: vec![],
+            splices: vec![],
         }
     }
 
@@ -117,10 +120,11 @@ impl Timeline {
             .samples
             .saturating_sub((LIVE_KEEP_S * self.sample_rate as f64) as usize);
         self.triggers.retain(|t| t.end_sample >= horizon);
+        self.splices.retain(|&s| s >= horizon);
     }
 }
 
-/// 看哪一段：`end` 秒往前 `span` 秒。直播跟着最新样本走，拖动后停住。
+/// 看哪一段：`end` 秒往前 `span` 秒。直播跟着最新样本走，拖动后停住（麦克风照录）。
 #[derive(Clone, Copy)]
 struct View {
     end: f64,
@@ -129,7 +133,8 @@ struct View {
 }
 
 enum Source {
-    Live,
+    /// 暂停时麦克风关着，继续时接着同一条流（检测器的历史不清）。
+    Live { paused: bool },
     File {
         path: PathBuf,
         channel: usize,
@@ -168,7 +173,9 @@ pub struct App {
     busy: bool,
 
     devices: Vec<String>,
+    /// 选中的设备；`None` 是系统默认。只记名字，直播在听时才开。
     device: Option<String>,
+    /// 只在直播在听时有：持有即录音。
     input: Option<Input>,
     resampler: Option<Resampler>,
     popped: Vec<f32>,
@@ -188,8 +195,8 @@ pub struct App {
     resolution: Resolution,
     strip: Strip,
     selected: Option<usize>,
-    /// 这条直播流开始时麦克风已经丢了多少样本。
-    dropped_at_start: u64,
+    /// 这条直播流里已经关掉的设备丢了多少样本。
+    dropped: u64,
 
     updater: appkit::ui::Updater,
 }
@@ -216,7 +223,7 @@ impl App {
             input: None,
             resampler: None,
             popped: vec![],
-            source: Source::Live,
+            source: Source::Live { paused: false },
             timeline: Timeline::new(16_000, None),
             view: View {
                 end: 0.0,
@@ -234,15 +241,15 @@ impl App {
             resolution: Resolution::Multi,
             strip: Strip::default(),
             selected: None,
-            dropped_at_start: 0,
+            dropped: 0,
             updater: appkit::ui::Updater::new(identity, &cc.egui_ctx),
         };
         for path in bundles {
             app.import(path);
         }
-        app.switch_device(None);
-        if let Some(path) = audio {
-            app.open_file(path, 0);
+        match audio {
+            Some(path) => app.open_file(path, 0),
+            None => app.start_live(true),
         }
         app
     }
@@ -256,27 +263,73 @@ impl App {
         self.worker.send(Cmd::Import(path));
     }
 
-    fn start_live(&mut self) {
+    /// 从开机重来一条直播流；`listen` 为假时停在暂停上，不开麦克风。
+    fn start_live(&mut self, listen: bool) {
         self.epoch = self.worker.bump();
         self.worker.send(Cmd::Live { epoch: self.epoch });
-        self.source = Source::Live;
+        self.source = Source::Live { paused: true };
         self.timeline = Timeline::new(self.rate(), self.one.as_ref());
         self.timing = Timing::default();
         self.selected = None;
         self.view.follow = true;
         self.view.span = self.view.span.min(30.0);
-        self.resampler = self
-            .input
-            .as_ref()
-            .map(|i| Resampler::new(i.sample_rate, self.rate()));
-        // 停在前面的旧样本不是这条流的
-        if let Some(input) = &mut self.input {
-            self.dropped_at_start = input.stats.dropped();
-            while input.consumer.pop().is_ok() {}
+        // 重开设备：缓冲里的旧样本不是这条流的
+        self.close_input();
+        self.dropped = 0;
+        if listen {
+            self.resume();
         }
     }
 
+    /// 关麦克风，直播停在当前时刻。
+    fn pause(&mut self) {
+        self.close_input();
+        if let Source::Live { paused } = &mut self.source {
+            *paused = true;
+        }
+    }
+
+    /// 开麦克风接着这条流；停着的那段不进时间轴，记一个拼接点。
+    fn resume(&mut self) {
+        if !self.open_input() {
+            return;
+        }
+        if let Source::Live { paused } = &mut self.source {
+            *paused = false;
+        }
+        if self.timeline.samples > 0 {
+            self.timeline.splices.push(self.timeline.samples);
+        }
+    }
+
+    fn open_input(&mut self) -> bool {
+        if self.input.is_some() {
+            return true;
+        }
+        match audio::open(self.device.as_deref()) {
+            Ok(input) => {
+                self.device = Some(input.device_name.clone());
+                self.resampler = Some(Resampler::new(input.sample_rate, self.rate()));
+                self.input = Some(input);
+                self.error = None;
+                true
+            }
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+
+    fn close_input(&mut self) {
+        if let Some(input) = self.input.take() {
+            self.dropped += input.stats.dropped();
+        }
+        self.resampler = None;
+    }
+
     fn open_file(&mut self, path: PathBuf, channel: usize) {
+        self.close_input();
         self.epoch = self.worker.bump();
         self.worker.send(Cmd::Open {
             epoch: self.epoch,
@@ -298,25 +351,15 @@ impl App {
     /// 换了模型：当前的流从头再来。
     fn restart(&mut self) {
         match &self.source {
-            Source::Live => self.start_live(),
+            Source::Live { paused } => self.start_live(!paused),
             Source::File { path, channel, .. } => self.open_file(path.clone(), *channel),
         }
     }
 
+    /// 选了设备就是要听它：从开机重来一条直播流。
     fn switch_device(&mut self, name: Option<String>) {
-        // 先停旧流，有的后端不允许同一设备开两条
-        self.input = None;
-        match audio::open(name.as_deref()) {
-            Ok(input) => {
-                self.device = Some(input.device_name.clone());
-                self.input = Some(input);
-                self.error = None;
-            }
-            Err(e) => self.error = Some(e),
-        }
-        if matches!(self.source, Source::Live) {
-            self.start_live();
-        }
+        self.device = name;
+        self.start_live(true);
     }
 
     fn drain_replies(&mut self) {
@@ -395,7 +438,7 @@ impl App {
         while let Ok(s) = input.consumer.pop() {
             self.popped.push(s);
         }
-        if !matches!(self.source, Source::Live) || self.popped.is_empty() {
+        if !matches!(self.source, Source::Live { paused: false }) || self.popped.is_empty() {
             return;
         }
         let Some(resampler) = &mut self.resampler else {
@@ -413,6 +456,14 @@ impl App {
         self.timeline.trim();
     }
 
+    fn toggle_pause(&mut self) {
+        match self.source {
+            Source::Live { paused: true } => self.resume(),
+            Source::Live { paused: false } => self.pause(),
+            Source::File { .. } => {}
+        }
+    }
+
     fn set_thresholds(&mut self) {
         self.worker.send(Cmd::Thresholds {
             t1: self.t1,
@@ -423,11 +474,12 @@ impl App {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let live = matches!(self.source, Source::Live);
+                let live = matches!(self.source, Source::Live { .. });
+                let paused = matches!(self.source, Source::Live { paused: true });
                 let mut chosen = None;
                 egui::ComboBox::from_id_salt("device")
                     .width(220.0)
-                    .selected_text(self.device.as_deref().unwrap_or("No input"))
+                    .selected_text(self.device.as_deref().unwrap_or("Default input"))
                     .show_ui(ui, |ui| {
                         for name in &self.devices {
                             if ui
@@ -443,26 +495,44 @@ impl App {
                 }
                 if chosen.is_some() && (chosen != self.device || !live) {
                     self.switch_device(chosen);
-                    self.start_live();
                 }
                 if live {
-                    let label = if self.view.follow {
-                        "⏸ Hold"
+                    let (label, tip) = if paused {
+                        (
+                            "▶ Resume",
+                            "Space · Opens the microphone and continues this stream: \
+                             the paused stretch is cut out and marked on the timeline, \
+                             and the detector keeps its history",
+                        )
                     } else {
-                        "▶ Follow"
+                        (
+                            "⏸ Pause",
+                            "Space · Closes the microphone; nothing is recorded or scored \
+                             until you resume",
+                        )
                     };
-                    if ui.button(label).on_hover_text("Space").clicked() {
-                        self.view.follow = !self.view.follow;
+                    if ui.button(label).on_hover_text(tip).clicked() {
+                        self.toggle_pause();
                     }
                     if ui
                         .button("⟲ Restart")
                         .on_hover_text("Start the stream again from boot")
                         .clicked()
                     {
-                        self.start_live();
+                        self.start_live(true);
+                    }
+                    if !self.view.follow
+                        && ui
+                            .button("⇥ Latest")
+                            .on_hover_text(
+                                "Scroll back to the newest audio and follow it (double-click)",
+                            )
+                            .clicked()
+                    {
+                        self.view.follow = true;
                     }
                 } else if ui.button("🎤 Live").clicked() {
-                    self.start_live();
+                    self.start_live(true);
                 }
                 if ui.button("📂 Open audio…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
@@ -492,8 +562,12 @@ impl App {
                                 .show_percentage(),
                         );
                         ui.label("Stage one");
-                    } else if live && !self.view.follow {
-                        ui.label(RichText::new("HOLD").color(Color32::LIGHT_RED).strong());
+                    } else if paused {
+                        ui.label(
+                            RichText::new("PAUSED · mic off")
+                                .color(Color32::LIGHT_RED)
+                                .strong(),
+                        );
                     }
                 });
             });
@@ -661,7 +735,7 @@ impl App {
             .small()
             .weak(),
         );
-        if matches!(self.source, Source::Live) {
+        if matches!(self.source, Source::Live { .. }) {
             ui.label(
                 RichText::new("Live: a new threshold applies from now on.")
                     .small()
@@ -690,8 +764,8 @@ impl App {
                 ui.label("—");
             }
             ui.end_row();
-            if let (Source::Live, Some(input)) = (&self.source, &self.input) {
-                let dropped = input.stats.dropped() - self.dropped_at_start;
+            if let Source::Live { .. } = self.source {
+                let dropped = self.dropped + self.input.as_ref().map_or(0, |i| i.stats.dropped());
                 if dropped > 0 {
                     ui.label(RichText::new("Dropped").color(Color32::LIGHT_RED));
                     ui.label(
@@ -810,9 +884,11 @@ impl App {
         self.updater.settings(ui);
         ui.separator();
         ui.label(
-            RichText::new("Drag to pan · scroll to zoom · Space hold / follow")
-                .small()
-                .weak(),
+            RichText::new(
+                "Drag to pan · scroll to zoom · double-click to follow · Space pause / resume",
+            )
+            .small()
+            .weak(),
         );
     }
 
@@ -955,6 +1031,7 @@ impl App {
                 self.draw_freq_ticks(&painter, spec);
                 self.draw_triggers(&painter.with_clip_rect(spec), spec);
                 self.draw_scores(&painter, score);
+                self.draw_splices(&painter, spec.union(score));
                 self.draw_time_axis(&painter, axis, spec);
                 if let Some(p) = response.hover_pos() {
                     self.draw_hover(&painter, spec, score, p);
@@ -968,7 +1045,7 @@ impl App {
     }
 
     fn navigate(&mut self, ui: &egui::Ui, response: &egui::Response, plot: Rect) {
-        let live = matches!(self.source, Source::Live);
+        let live = matches!(self.source, Source::Live { .. });
         let duration = self.timeline.duration();
         if self.view.follow && live {
             self.view.end = duration.max(self.view.span);
@@ -1108,6 +1185,31 @@ impl App {
             );
             painter.rect_filled(bg, 3.0, Color32::from_black_alpha(170));
             painter.galley(bg.min + vec2(3.0, 1.0), galley, color);
+        }
+    }
+
+    /// 暂停处：两边的音频在时间轴上挨着，其实中间停过。
+    fn draw_splices(&self, painter: &Painter, rect: Rect) {
+        let (t0, t1) = self.window();
+        for &s in &self.timeline.splices {
+            let t = self.timeline.seconds(s);
+            if t < t0 || t > t1 {
+                continue;
+            }
+            let x = self.time_x(rect, t);
+            painter.extend(Shape::dashed_line(
+                &[pos2(x, rect.top()), pos2(x, rect.bottom())],
+                Stroke::new(1.5f32, Color32::WHITE),
+                4.0,
+                4.0,
+            ));
+            painter.text(
+                pos2(x + 3.0, rect.bottom() - 3.0),
+                Align2::LEFT_BOTTOM,
+                "paused",
+                FontId::proportional(11.0),
+                Color32::WHITE,
+            );
         }
     }
 
@@ -1288,8 +1390,11 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && matches!(self.source, Source::Live) {
-            self.view.follow = !self.view.follow;
+        // 吃掉这个键，免得刚点过的按钮再被它按一次；正在输入时让给输入框
+        if !ctx.wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+        {
+            self.toggle_pause();
         }
         self.drain_replies();
         self.pump_audio();
