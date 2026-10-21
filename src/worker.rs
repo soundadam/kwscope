@@ -313,6 +313,10 @@ impl Worker {
             at += step;
         }
         self.pending.drain(..at);
+        // 直播不重放：记住的分只会越攒越多
+        if let Some(j) = &mut engine.judge {
+            j.cache.clear();
+        }
         if at > 0 {
             let seconds = began.elapsed().as_secs_f64();
             self.reply(Reply::Scores {
@@ -538,5 +542,89 @@ mod tests {
             .iter()
             .filter(|t| seen.contains(&(t.decision_frame as u64)))
             .all(|t| t.stage_two_seconds.is_none()));
+    }
+
+    fn key(triggers: &[Trigger]) -> Vec<(usize, bool, usize)> {
+        triggers
+            .iter()
+            .map(|t| (t.decision_frame, t.accepted, t.end_sample))
+            .collect()
+    }
+
+    fn file(h: &Handle, epoch: u64) -> Vec<Trigger> {
+        loop {
+            match next(h) {
+                Reply::File { epoch: e, file } if e == epoch => break file.triggers,
+                _ => {}
+            }
+        }
+    }
+
+    /// 默认阈值下，界面打开文件、改阈值再改回、重导一级、再开同一个文件，触发都和
+    /// `kwscope stream`（`Engine::run`）的一样，一份也不会叠上去。
+    #[test]
+    fn replaying_a_file_gives_kwscope_stream_triggers() {
+        use crate::app::{DEFAULT_T1, DEFAULT_T2};
+        let scratch = std::env::temp_dir().join("kwscope-import");
+        let mut models = adapter::import(&fixtures().join("bundles/stage_one"), &scratch).unwrap();
+        models.extend(adapter::import(&fixtures().join("bundles/stage_two"), &scratch).unwrap());
+        let (mut one, mut two) = (None, None);
+        for m in models {
+            match m {
+                Model::StageOne(m) => one = Some(m),
+                Model::StageTwo(m) => two = Some(m),
+            }
+        }
+        let one = one.unwrap();
+        let rate = one.info().sample_rate;
+        let mut engine = Engine::new(
+            one,
+            Some(Judge::new(two.unwrap(), DEFAULT_T2)),
+            DetectorConfig::det_v8(DEFAULT_T1),
+        )
+        .unwrap();
+        let clip = fixtures().join("thchs30_clip.wav");
+        let samples = media::decode(&clip).unwrap().channels.remove(0);
+        let want = key(&engine
+            .run(&samples, engine::step_samples(rate, engine::CHUNK_MS))
+            .unwrap());
+        // 随机初始化的二级在 t2 = 1.2 下全拒，拒绝不锁定：比只有一级时多
+        assert!(!want.is_empty() && want.iter().all(|&(_, accepted, _)| !accepted));
+
+        let h = spawn(|| {}, DEFAULT_T1, DEFAULT_T2);
+        loaded(&h);
+        let open = |h: &Handle| {
+            let epoch = h.bump();
+            h.send(Cmd::Open {
+                epoch,
+                path: clip.clone(),
+                channel: 0,
+            });
+            file(h, epoch)
+        };
+        assert_eq!(key(&open(&h)), want);
+
+        h.send(Cmd::Thresholds {
+            t1: 0.553,
+            t2: DEFAULT_T2,
+        });
+        let Reply::Triggers { .. } = next(&h) else {
+            panic!("expected triggers")
+        };
+        h.send(Cmd::Thresholds {
+            t1: DEFAULT_T1,
+            t2: DEFAULT_T2,
+        });
+        let Reply::Triggers { triggers, .. } = next(&h) else {
+            panic!("expected triggers")
+        };
+        assert_eq!(key(&triggers), want);
+
+        h.send(Cmd::Import(fixtures().join("bundles/stage_one")));
+        let Reply::Models { .. } = next(&h) else {
+            panic!("expected models")
+        };
+        assert_eq!(key(&open(&h)), want);
+        assert_eq!(key(&open(&h)), want);
     }
 }
