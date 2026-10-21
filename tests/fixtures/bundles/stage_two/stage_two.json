@@ -1,0 +1,41 @@
+{
+  "format": "kws_stage_two.v2",
+  "keywords": [
+    "NIHAO_KAKA"
+  ],
+  "members": [
+    {
+      "cmn": true,
+      "feature_dim": 80,
+      "fixed": null,
+      "frontend": "member_0.npz",
+      "hop_length": 160,
+      "leads": [
+        21600,
+        27200
+      ],
+      "log_offset": 1e-06,
+      "min_samples": 512,
+      "model": "member_0.onnx",
+      "n_fft": 512,
+      "source": {
+        "crop": {
+          "fixed_ms": null,
+          "leads_ms": [
+            1350.0,
+            1700.0
+          ]
+        },
+        "weights": "random init, torch.manual_seed(2)"
+      }
+    }
+  ],
+  "sample_rate": 16000,
+  "scoring": {
+    "blank": null,
+    "disc": 1.0,
+    "floor": null,
+    "phone": 0.0,
+    "phones": {}
+  }
+}

@@ -1,9 +1,9 @@
-# soundadam.com 把这个目录作为 Hugo module 引入，渲染成 /projects/tonescope/
-# （中文在 /zh/projects/tonescope/）。页面 schema 见 www-src 的 .claude/rules/content-schema.md。
+# soundadam.com 把这个目录作为 Hugo module 引入，渲染成 /projects/kwscope/
+# （中文在 /zh/projects/kwscope/）。页面 schema 见 www-src 的 .claude/rules/content-schema.md。
 [module]
   [[module.mounts]]
     source = "content"
-    target = "content/projects/tonescope"
+    target = "content/projects/kwscope"
   [[module.mounts]]
     source = "img"
-    target = "assets/img/projects/tonescope"
+    target = "assets/img/projects/kwscope"

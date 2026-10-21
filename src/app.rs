@@ -1,180 +1,304 @@
 use crate::audio::{self, Input};
-use crate::axis::LogAxis;
 use crate::colormap::Colormap;
-use crate::dsp::{self, Stft};
-use crate::music::{self, Scale, NOTE_NAMES};
-use crate::perf::{Latency, Pace, Perf};
-use crate::pitch::Yin;
-use crate::waterfall::{RowMap, Waterfall};
+use crate::spectrogram::Spectrogram;
+use crate::worker::{self, Cmd, FileView, Handle, Reply};
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Shape, Slider,
     Stroke, TextureHandle, TextureOptions,
 };
-use std::time::{Duration, Instant};
+use kwscope::kws::adapter::{StageOneInfo, StageTwoInfo};
+use kwscope::kws::detector::DetectorConfig;
+use kwscope::kws::engine::Trigger;
+use kwscope::kws::{jsonl, media::Resampler};
+use std::path::PathBuf;
+use std::time::Duration;
 
-// 纹理分辨率与窗口无关，GPU 线性缩放到绘制区域
-const ROWS: usize = 600;
-const COLS: usize = 1024;
-/// 横向要绕回，见 `central` 里的 uv。
-const TEXTURE: TextureOptions = TextureOptions::LINEAR_REPEAT;
-const FFT_SIZES: [usize; 5] = [1024, 2048, 4096, 8192, 16384];
-const HOPS: [usize; 5] = [128, 256, 512, 1024, 2048];
-const FREQ_TICKS: [f32; 15] = [
-    20.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1e3, 2e3, 3e3, 5e3, 1e4, 1.5e4, 2e4, 3e4,
-];
-const MAX_HARMONIC: u32 = 8;
-
-// 覆盖人声和多数旋律乐器的基频
-const PITCH_MIN: f32 = 40.0;
-const PITCH_MAX: f32 = 2_000.0;
-// 相邻两列音高差超过这么多半音就断开轨迹，不画竖直连线
-const MAX_TRACK_JUMP: f32 = 2.0;
-
+/// kws-train 台账上一级 12 FA/h 的阈值与二级的现役阈值。
+pub const DEFAULT_T1: f64 = 0.33140625;
+pub const DEFAULT_T2: f64 = 1.2;
+/// 直播留多久的图、分与触发。
+const LIVE_KEEP_S: f64 = 300.0;
 const COPYRIGHT_YEAR: u32 = 2026;
-/// 帧率上限选项；`None` 跟显示器刷新率。
-const FRAME_RATES: [Option<u32>; 3] = [None, Some(60), Some(30)];
-/// 电平持续低于门限这么久算没声音，帧率降到 `QUIET_FPS`。
-const QUIET_HOLD: Duration = Duration::from_millis(500);
-const QUIET_FPS: f32 = 15.0;
-
-const HZ_GUTTER: f32 = 44.0;
-const NOTE_GUTTER: f32 = 44.0;
-const LIVE_W: f32 = 160.0;
-// 相邻音名标签的最小间距（像素），更密时只画线不写字
-const LABEL_SPACING: f32 = 11.0;
+/// 直播时的重画间隔：麦克风环形缓冲按这个节奏取。
+const LIVE_REPAINT: Duration = Duration::from_millis(33);
+const MAX_TEXTURE_W: usize = 4096;
 
 const BG: Color32 = Color32::from_gray(12);
 const AMBER: Color32 = Color32::from_rgb(255, 214, 102);
 const CYAN: Color32 = Color32::from_rgb(120, 200, 255);
-const GREEN: Color32 = Color32::from_rgb(110, 255, 140);
+const GREEN: Color32 = Color32::from_rgb(90, 230, 120);
+const RED: Color32 = Color32::from_rgb(255, 90, 90);
+const SCORE_H: f32 = 140.0;
+const AXIS_H: f32 = 20.0;
+const HZ_GUTTER: f32 = 44.0;
+const FREQ_TICKS: [f32; 9] = [100.0, 200.0, 500.0, 1e3, 2e3, 3e3, 5e3, 8e3, 1.6e4];
+const TIME_STEPS: [f64; 12] = [
+    0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
+];
 
-#[derive(Clone, Copy, PartialEq)]
-struct Analysis {
-    fft_size: usize,
+/// 一条时间轴上的一切：语谱、一级的分、触发。直播与离线共用。
+struct Timeline {
+    sample_rate: u32,
+    spec: Spectrogram,
+    /// 开机以来的样本数。
+    samples: usize,
+    keywords: Vec<String>,
     hop: usize,
+    n_fft: usize,
+    probs: Vec<f32>,
+    /// `probs` 第一帧是开机以来第几帧。
+    first_frame: usize,
+    triggers: Vec<Trigger>,
+}
+
+impl Timeline {
+    fn new(sample_rate: u32, one: Option<&StageOneInfo>) -> Self {
+        Self {
+            sample_rate,
+            spec: Spectrogram::new(sample_rate),
+            samples: 0,
+            keywords: one.map(|i| i.keywords.clone()).unwrap_or_default(),
+            hop: one.map_or(160, |i| i.hop),
+            n_fft: one.map_or(400, |i| i.n_fft),
+            probs: vec![],
+            first_frame: 0,
+            triggers: vec![],
+        }
+    }
+
+    fn from_file(file: FileView, one: Option<&StageOneInfo>) -> Self {
+        let mut t = Self::new(file.spec.sample_rate, one);
+        t.samples = file.samples;
+        t.spec = file.spec;
+        t.probs = file.probs;
+        t.triggers = file.triggers;
+        t
+    }
+
+    fn duration(&self) -> f64 {
+        self.samples as f64 / self.sample_rate as f64
+    }
+
+    fn seconds(&self, sample: usize) -> f64 {
+        sample as f64 / self.sample_rate as f64
+    }
+
+    fn k(&self) -> usize {
+        self.keywords.len().max(1)
+    }
+
+    fn frame_end(&self) -> usize {
+        self.first_frame + self.probs.len() / self.k()
+    }
+
+    /// 第 `frame` 帧的分在它最后一个样本处才有：画在那里，和触发的终点对齐。
+    fn frame_time(&self, frame: usize) -> f64 {
+        self.seconds(frame * self.hop + self.n_fft)
+    }
+
+    fn prob(&self, frame: usize, index: usize) -> Option<f32> {
+        let j = frame.checked_sub(self.first_frame)?;
+        self.probs.get(j * self.k() + index).copied()
+    }
+
+    fn trim(&mut self) {
+        let keep_cols = (LIVE_KEEP_S / crate::spectrogram::HOP_S) as usize;
+        self.spec.trim(keep_cols);
+        let k = self.k();
+        let keep_frames = (LIVE_KEEP_S * self.sample_rate as f64 / self.hop as f64) as usize;
+        let have = self.probs.len() / k;
+        if have > keep_frames + keep_frames / 4 {
+            let drop = have - keep_frames;
+            self.probs.drain(..drop * k);
+            self.first_frame += drop;
+        }
+        let horizon = self
+            .samples
+            .saturating_sub((LIVE_KEEP_S * self.sample_rate as f64) as usize);
+        self.triggers.retain(|t| t.end_sample >= horizon);
+    }
+}
+
+/// 看哪一段：`end` 秒往前 `span` 秒。直播跟着最新样本走，拖动后停住。
+#[derive(Clone, Copy)]
+struct View {
+    end: f64,
+    span: f64,
+    follow: bool,
+}
+
+enum Source {
+    Live,
+    File {
+        path: PathBuf,
+        channel: usize,
+        channels: usize,
+        source_rate: u32,
+        /// 还在跑一级时的进度。
+        progress: Option<f32>,
+    },
+}
+
+#[derive(Default)]
+struct Timing {
+    stage_two_n: usize,
+    stage_two_sum: f64,
+    stage_two_max: f64,
+    /// 最近一次直播推送：一级加二级花的秒数、推了多少秒的音频。
+    push: Option<(f64, f64)>,
+}
+
+impl Timing {
+    fn add(&mut self, triggers: &[Trigger]) {
+        for s in triggers.iter().filter_map(|t| t.stage_two_seconds) {
+            self.stage_two_n += 1;
+            self.stage_two_sum += s;
+            self.stage_two_max = self.stage_two_max.max(s);
+        }
+    }
 }
 
 pub struct App {
+    worker: Handle,
+    epoch: u64,
+    one: Option<StageOneInfo>,
+    two: Option<StageTwoInfo>,
+    error: Option<String>,
+    busy: bool,
+
     devices: Vec<String>,
     device: Option<String>,
     input: Option<Input>,
-    error: Option<String>,
-    sample_rate: f32,
-    samples: Vec<f32>,
+    resampler: Option<Resampler>,
+    popped: Vec<f32>,
 
-    analysis: Analysis,
-    stft: Stft,
-    yin: Yin,
-    waterfall: Waterfall,
-    peak: Option<(f32, f32)>,
-    paused: bool,
-    perf: Perf,
-    max_fps: Option<u32>,
-    /// 最近一次有帧电平达到门限的时刻。
-    last_loud: Option<Instant>,
-    pace: Pace,
+    source: Source,
+    timeline: Timeline,
+    view: View,
+    timing: Timing,
+    t1: f64,
+    t2: f64,
 
-    axis: LogAxis,
     db_lo: f32,
     db_hi: f32,
     colormap: Colormap,
     lut: [Color32; 256],
     texture: Option<TextureHandle>,
-    /// 纹理现有像素用的色表与 dB 范围；变了就整张重新着色。
-    painted: Option<(Colormap, f32, f32)>,
-
-    scale: Option<Scale>,
-    tonic: u8,
-    a4: f32,
-    level_gate: f32,
-    show_pitch: bool,
-    harmonics: bool,
+    /// 纹理现在画的是什么；变了才重新着色。
+    painted: Option<(usize, usize, usize, usize, Colormap, f32, f32)>,
+    selected: Option<usize>,
+    /// 这条直播流开始时麦克风已经丢了多少样本。
+    dropped_at_start: u64,
 
     updater: appkit::ui::Updater,
 }
 
-/// 音高窗长：两倍最长周期向上取 2 的幂，且不超过 FFT 帧长（取帧中央那一段，
-/// 与瀑布图该列对齐）。
-fn pitch_window(fft_size: usize, sample_rate: f32) -> usize {
-    let want = ((2.0 * sample_rate / PITCH_MIN).ceil() as usize).next_power_of_two();
-    want.min(fft_size)
-}
-
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, identity: appkit::App) -> Self {
-        let analysis = Analysis {
-            fft_size: 4096,
-            hop: 256,
-        };
-        let axis = LogAxis {
-            f_min: 50.0,
-            f_max: 8_000.0,
-        };
-        let sample_rate = 48_000.0;
-        let stft = Stft::new(analysis.fft_size, analysis.hop);
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        identity: appkit::App,
+        bundles: Vec<PathBuf>,
+        audio: Option<PathBuf>,
+    ) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        let worker = worker::spawn(move || ctx.request_repaint(), DEFAULT_T1, DEFAULT_T2);
         let colormap = Colormap::Magma;
         let mut app = Self {
+            worker,
+            epoch: 0,
+            one: None,
+            two: None,
+            error: None,
+            busy: false,
             devices: audio::input_device_names(),
             device: None,
             input: None,
-            error: None,
-            sample_rate,
-            samples: Vec::new(),
-            waterfall: Waterfall::new(
-                COLS,
-                RowMap::new(
-                    axis,
-                    ROWS,
-                    stft.bins(),
-                    sample_rate / analysis.fft_size as f32,
-                ),
-            ),
-            yin: Yin::new(pitch_window(analysis.fft_size, sample_rate), sample_rate),
-            stft,
-            analysis,
-            peak: None,
-            paused: false,
-            perf: Perf::default(),
-            max_fps: None,
-            // 启动后先按刷新率跑一小会儿，量出显示器刷新率
-            last_loud: Some(Instant::now()),
-            pace: Pace::Vsync,
-            axis,
+            resampler: None,
+            popped: vec![],
+            source: Source::Live,
+            timeline: Timeline::new(16_000, None),
+            view: View {
+                end: 0.0,
+                span: 8.0,
+                follow: true,
+            },
+            timing: Timing::default(),
+            t1: DEFAULT_T1,
+            t2: DEFAULT_T2,
             db_lo: -100.0,
             db_hi: -20.0,
             colormap,
             lut: colormap.lut(),
             texture: None,
             painted: None,
-            scale: Some(Scale::Chromatic),
-            tonic: 0,
-            a4: 440.0,
-            // 笔记本内置麦克风的环境底噪约 −50 dB，门限放在它上面
-            level_gate: -45.0,
-            show_pitch: true,
-            harmonics: true,
+            selected: None,
+            dropped_at_start: 0,
             updater: appkit::ui::Updater::new(identity, &cc.egui_ctx),
         };
+        for path in bundles {
+            app.import(path);
+        }
         app.switch_device(None);
+        if let Some(path) = audio {
+            app.open_file(path, 0);
+        }
         app
     }
 
-    fn bin_hz(&self) -> f32 {
-        self.sample_rate / self.analysis.fft_size as f32
+    fn rate(&self) -> u32 {
+        self.one.as_ref().map_or(16_000, |i| i.sample_rate)
     }
 
-    fn row_map(&self) -> RowMap {
-        RowMap::new(self.axis, ROWS, self.stft.bins(), self.bin_hz())
+    fn import(&mut self, path: PathBuf) {
+        self.busy = true;
+        self.worker.send(Cmd::Import(path));
     }
 
-    fn reset_analysis(&mut self) {
-        self.stft = Stft::new(self.analysis.fft_size, self.analysis.hop);
-        self.yin = Yin::new(
-            pitch_window(self.analysis.fft_size, self.sample_rate),
-            self.sample_rate,
-        );
-        self.waterfall = Waterfall::new(COLS, self.row_map());
-        self.peak = None;
+    fn start_live(&mut self) {
+        self.epoch = self.worker.bump();
+        self.worker.send(Cmd::Live { epoch: self.epoch });
+        self.source = Source::Live;
+        self.timeline = Timeline::new(self.rate(), self.one.as_ref());
+        self.timing = Timing::default();
+        self.selected = None;
+        self.view.follow = true;
+        self.view.span = self.view.span.min(30.0);
+        self.resampler = self
+            .input
+            .as_ref()
+            .map(|i| Resampler::new(i.sample_rate, self.rate()));
+        // 停在前面的旧样本不是这条流的
+        if let Some(input) = &mut self.input {
+            self.dropped_at_start = input.stats.dropped();
+            while input.consumer.pop().is_ok() {}
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf, channel: usize) {
+        self.epoch = self.worker.bump();
+        self.worker.send(Cmd::Open {
+            epoch: self.epoch,
+            path: path.clone(),
+            channel,
+        });
+        self.source = Source::File {
+            path,
+            channel,
+            channels: 1,
+            source_rate: 0,
+            progress: Some(0.0),
+        };
+        self.timeline = Timeline::new(self.rate(), self.one.as_ref());
+        self.timing = Timing::default();
+        self.selected = None;
+    }
+
+    /// 换了模型：当前的流从头再来。
+    fn restart(&mut self) {
+        match &self.source {
+            Source::Live => self.start_live(),
+            Source::File { path, channel, .. } => self.open_file(path.clone(), *channel),
+        }
     }
 
     fn switch_device(&mut self, name: Option<String>) {
@@ -182,85 +306,126 @@ impl App {
         self.input = None;
         match audio::open(name.as_deref()) {
             Ok(input) => {
-                self.sample_rate = input.sample_rate as f32;
                 self.device = Some(input.device_name.clone());
                 self.input = Some(input);
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
         }
-        self.axis.f_max = self.axis.f_max.min(self.sample_rate / 2.0);
-        self.reset_analysis();
+        if matches!(self.source, Source::Live) {
+            self.start_live();
+        }
+    }
+
+    fn drain_replies(&mut self) {
+        while let Ok(reply) = self.worker.rx.try_recv() {
+            match reply {
+                Reply::Models { one, two } => {
+                    self.busy = false;
+                    self.error = None;
+                    self.one = one;
+                    self.two = two;
+                    self.restart();
+                }
+                Reply::Error(e) => {
+                    self.busy = false;
+                    self.error = Some(e);
+                    if let Source::File { progress, .. } = &mut self.source {
+                        *progress = None;
+                    }
+                }
+                Reply::Scores {
+                    epoch,
+                    probs,
+                    triggers,
+                    seconds,
+                } if epoch == self.epoch => {
+                    let k = self.timeline.k();
+                    let pushed = probs.len() / k * self.timeline.hop;
+                    self.timing.push = Some((seconds, self.timeline.seconds(pushed)));
+                    self.timing.add(&triggers);
+                    self.timeline.probs.extend(probs);
+                    self.timeline.triggers.extend(triggers);
+                }
+                Reply::Progress { epoch, done } if epoch == self.epoch => {
+                    if let Source::File { progress, .. } = &mut self.source {
+                        *progress = Some(done);
+                    }
+                }
+                Reply::File { epoch, file } if epoch == self.epoch => {
+                    if let Source::File {
+                        channels,
+                        channel,
+                        source_rate,
+                        progress,
+                        ..
+                    } = &mut self.source
+                    {
+                        *channels = file.channels;
+                        *channel = file.channel;
+                        *source_rate = file.source_rate;
+                        *progress = None;
+                    }
+                    self.timing.add(&file.triggers);
+                    self.timeline = Timeline::from_file(*file, self.one.as_ref());
+                    let d = self.timeline.duration();
+                    self.view = View {
+                        span: d.clamp(1.0, 20.0),
+                        end: d.clamp(1.0, 20.0),
+                        follow: false,
+                    };
+                    self.painted = None;
+                }
+                Reply::Triggers { epoch, triggers } if epoch == self.epoch => {
+                    self.timing.add(&triggers);
+                    self.timeline.triggers = triggers;
+                    self.selected = None;
+                }
+                _ => {}
+            }
+        }
     }
 
     fn pump_audio(&mut self) {
         let Some(input) = self.input.as_mut() else {
             return;
         };
-        self.samples.clear();
+        self.popped.clear();
         while let Ok(s) = input.consumer.pop() {
-            self.samples.push(s);
+            self.popped.push(s);
         }
-        self.perf.popped.add(self.samples.len() as f32);
-        // 暂停时照样取走样本，恢复后直接接上实时
-        if self.paused {
-            self.perf.dsp.add(0.0);
-            self.perf.cols.add(0.0);
+        if !matches!(self.source, Source::Live) || self.popped.is_empty() {
             return;
         }
-        let wf = &mut self.waterfall;
-        let yin = &mut self.yin;
-        let gate = self.level_gate;
-        let mut cols = 0;
-        let mut loud = false;
-        let t0 = Instant::now();
-        self.stft.process(&self.samples, |spec, frame| {
-            cols += 1;
-            let n = yin.len();
-            let start = (frame.len() - n) / 2;
-            let x = &frame[start..start + n];
-            let pitch = if dsp::rms_db(x) >= gate {
-                loud = true;
-                yin.detect(x, PITCH_MIN, PITCH_MAX)
-            } else {
-                None
-            };
-            wf.push(spec, pitch);
+        let Some(resampler) = &mut self.resampler else {
+            return;
+        };
+        let samples = resampler.push(&self.popped);
+        self.timeline.samples += samples.len();
+        self.timeline.spec.push(&samples);
+        if self.one.is_some() {
+            self.worker.send(Cmd::Samples {
+                epoch: self.epoch,
+                samples,
+            });
+        }
+        self.timeline.trim();
+    }
+
+    fn set_thresholds(&mut self) {
+        self.worker.send(Cmd::Thresholds {
+            t1: self.t1,
+            t2: self.t2,
         });
-        self.perf.dsp.add(t0.elapsed().as_secs_f32());
-        self.perf.cols.add(cols as f32);
-        if loud {
-            self.last_loud = Some(Instant::now());
-        }
-        self.perf.unframed.add(self.stft.unframed() as f32);
-        if let Some(latest) = self.waterfall.latest_raw() {
-            self.peak = dsp::peak(latest, self.bin_hz(), self.axis.f_min, self.axis.f_max);
-        }
-    }
-
-    fn freq_y(&self, rect: Rect, f: f32) -> f32 {
-        rect.bottom() - self.axis.unit_of(f) * rect.height()
-    }
-
-    fn y_freq(&self, rect: Rect, y: f32) -> f32 {
-        self.axis.freq_at((rect.bottom() - y) / rect.height())
-    }
-
-    fn gated_peak(&self) -> Option<(f32, f32)> {
-        self.peak.filter(|&(_, db)| db >= self.level_gate)
-    }
-
-    fn note_text(&self, f: f32) -> String {
-        let (m, cents) = music::nearest_note(f, self.a4);
-        format!("{:<4} {:+4.0} ct", music::note_name(m), cents)
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let live = matches!(self.source, Source::Live);
                 let mut chosen = None;
-                egui::ComboBox::from_label("")
-                    .width(240.0)
+                egui::ComboBox::from_id_salt("device")
+                    .width(220.0)
                     .selected_text(self.device.as_deref().unwrap_or("No input"))
                     .show_ui(ui, |ui| {
                         for name in &self.devices {
@@ -275,45 +440,94 @@ impl App {
                 if ui.button("⟳").on_hover_text("Rescan devices").clicked() {
                     self.devices = audio::input_device_names();
                 }
-                if chosen.is_some() && chosen != self.device {
+                if chosen.is_some() && (chosen != self.device || !live) {
                     self.switch_device(chosen);
+                    self.start_live();
                 }
-
-                let label = if self.paused {
-                    "▶ Resume"
-                } else {
-                    "⏸ Pause"
-                };
-                if ui.button(label).clicked() {
-                    self.paused = !self.paused;
+                if live {
+                    let label = if self.view.follow {
+                        "⏸ Hold"
+                    } else {
+                        "▶ Follow"
+                    };
+                    if ui.button(label).on_hover_text("Space").clicked() {
+                        self.view.follow = !self.view.follow;
+                    }
+                    if ui
+                        .button("⟲ Restart")
+                        .on_hover_text("Start the stream again from boot")
+                        .clicked()
+                    {
+                        self.start_live();
+                    }
+                } else if ui.button("🎤 Live").clicked() {
+                    self.start_live();
+                }
+                if ui.button("📂 Open audio…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Audio", &["wav", "wave", "flac"])
+                        .pick_file()
+                    {
+                        self.open_file(path, 0);
+                    }
                 }
                 ui.separator();
-
-                let latest = self.waterfall.pitch_at(self.waterfall.cols() - 1);
-                let readout = match latest {
-                    Some(f) => format!("Pitch {}  {:7.1} Hz", self.note_text(f), f),
-                    None => "Pitch —".into(),
-                };
-                ui.label(RichText::new(readout).monospace().size(18.0).color(GREEN));
+                self.counts(ui);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.updater.top_bar(ui);
                     if let Some(e) = &self.error {
                         ui.label(RichText::new(e).color(Color32::LIGHT_RED));
-                    } else if self.paused {
-                        ui.label(RichText::new("PAUSED").color(Color32::LIGHT_RED).strong());
-                    } else {
-                        ui.label(format!("{:.0} Hz", self.sample_rate));
+                    } else if self.busy {
+                        ui.spinner();
+                        ui.label("Importing…");
+                    } else if let Source::File {
+                        progress: Some(p), ..
+                    } = self.source
+                    {
+                        ui.add(
+                            egui::ProgressBar::new(p)
+                                .desired_width(160.0)
+                                .show_percentage(),
+                        );
+                        ui.label("Stage one");
+                    } else if live && !self.view.follow {
+                        ui.label(RichText::new("HOLD").color(Color32::LIGHT_RED).strong());
                     }
                 });
             });
         });
     }
 
-    fn settings_panel(&mut self, ctx: &egui::Context) {
+    fn counts(&self, ui: &mut egui::Ui) {
+        let t = &self.timeline.triggers;
+        let accepted = t.iter().filter(|t| t.accepted).count();
+        ui.label(
+            RichText::new(format!("Triggers {}", t.len()))
+                .monospace()
+                .size(16.0)
+                .color(AMBER),
+        );
+        if self.two.is_some() {
+            ui.label(
+                RichText::new(format!("Accepted {accepted}"))
+                    .monospace()
+                    .size(16.0)
+                    .color(GREEN),
+            );
+            ui.label(
+                RichText::new(format!("Rejected {}", t.len() - accepted))
+                    .monospace()
+                    .size(16.0)
+                    .color(RED),
+            );
+        }
+    }
+
+    fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("settings")
             .resizable(false)
-            .exact_width(240.0)
+            .exact_width(270.0)
             .show(ctx, |ui| {
                 egui::TopBottomPanel::bottom("credit")
                     .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 6.0)))
@@ -335,71 +549,231 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.heading("Analysis");
-        egui::ComboBox::from_label("FFT size")
-            .selected_text(self.analysis.fft_size.to_string())
-            .show_ui(ui, |ui| {
-                for n in FFT_SIZES {
-                    ui.selectable_value(&mut self.analysis.fft_size, n, n.to_string());
+        ui.heading("Bundles");
+        ui.horizontal(|ui| {
+            if ui.button("Import folder…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.import(dir);
                 }
-            });
-        let fft_size = self.analysis.fft_size;
-        self.analysis.hop = self.analysis.hop.min(fft_size);
-        egui::ComboBox::from_label("Hop")
-            .selected_text(self.analysis.hop.to_string())
-            .show_ui(ui, |ui| {
-                for h in HOPS.into_iter().filter(|&h| h <= fft_size) {
-                    ui.selectable_value(&mut self.analysis.hop, h, h.to_string());
+            }
+            if ui.button("Import zip…").clicked() {
+                if let Some(file) = rfd::FileDialog::new()
+                    .add_filter("Bundle", &["zip", "json"])
+                    .pick_file()
+                {
+                    self.import(file);
                 }
-            });
-        let dt = self.analysis.hop as f32 / self.sample_rate;
+            }
+        });
         ui.label(
-                    RichText::new(format!(
-                        "Δf {:.2} Hz  ·  Δt {:.1} ms\nwindow {:.0} ms  ·  history {:.1} s\nlowest pitch ≈ {:.0} Hz",
-                        self.bin_hz(),
-                        dt * 1e3,
-                        fft_size as f32 / self.sample_rate * 1e3,
-                        dt * COLS as f32,
-                        self.yin.lowest_freq().max(PITCH_MIN),
-                    ))
-                    .small()
-                    .weak(),
+            RichText::new("or drop a folder or .zip on the window")
+                .small()
+                .weak(),
+        );
+        let mut unload = (false, false);
+        match &self.one {
+            Some(one) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Stage one").strong());
+                    if ui.small_button("✖").on_hover_text("Unload").clicked() {
+                        unload.0 = true;
+                    }
+                });
+                ui.label(RichText::new(&one.format).monospace().small());
+                ui.label(format!(
+                    "{}  ·  {} Hz  ·  hop {}  ·  RF {}",
+                    one.keywords.join(", "),
+                    one.sample_rate,
+                    one.hop,
+                    one.receptive_field
+                ))
+                .on_hover_text(one.root.display().to_string());
+            }
+            None => {
+                ui.label(
+                    RichText::new("No stage one: the view shows the spectrogram only.").weak(),
                 );
+            }
+        }
+        match &self.two {
+            Some(two) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Stage two").strong());
+                    if ui.small_button("✖").on_hover_text("Unload").clicked() {
+                        unload.1 = true;
+                    }
+                });
+                ui.label(RichText::new(&two.format).monospace().small());
+                ui.label(format!(
+                    "{} member{}  ·  reads {:.2} s back",
+                    two.members,
+                    if two.members == 1 { "" } else { "s" },
+                    two.reach as f64 / two.sample_rate as f64
+                ))
+                .on_hover_text(two.root.display().to_string());
+            }
+            None if self.one.is_some() => {
+                ui.label(RichText::new("No stage two: every trigger is accepted.").weak());
+            }
+            None => {}
+        }
+        if unload.0 || unload.1 {
+            self.busy = true;
+            self.worker.send(Cmd::Unload {
+                stage_one: unload.0,
+                stage_two: unload.1,
+            });
+        }
 
         ui.separator();
-        ui.heading("Display");
-        let nyquist = self.sample_rate / 2.0;
+        ui.heading("Detection");
+        let (t1, t2) = (self.t1, self.t2);
         ui.add(
-            Slider::new(&mut self.axis.f_min, 20.0..=2_000.0)
-                .logarithmic(true)
-                .suffix(" Hz")
-                .text("f min"),
-        );
-        ui.add(
-            Slider::new(&mut self.axis.f_max, 200.0..=nyquist)
-                .logarithmic(true)
-                .suffix(" Hz")
-                .text("f max"),
-        );
-        // 至少留一个八度
-        if self.axis.f_max < self.axis.f_min * 2.0 {
-            self.axis.f_max = (self.axis.f_min * 2.0).min(nyquist);
-            self.axis.f_min = self.axis.f_min.min(self.axis.f_max / 2.0);
+            Slider::new(&mut self.t1, 0.01..=0.99)
+                .text("t1")
+                .fixed_decimals(4)
+                .clamping(egui::SliderClamping::Always),
+        )
+        .on_hover_text("Stage one arms when its score reaches this");
+        ui.add_enabled(
+            self.two.is_some(),
+            Slider::new(&mut self.t2, -5.0..=10.0)
+                .text("t2")
+                .fixed_decimals(2),
+        )
+        .on_hover_text("Stage two accepts a trigger whose logit is at or above this");
+        ui.horizontal(|ui| {
+            if ui.small_button("Defaults").clicked() {
+                self.t1 = DEFAULT_T1;
+                self.t2 = DEFAULT_T2;
+            }
+        });
+        if (self.t1, self.t2) != (t1, t2) {
+            self.set_thresholds();
         }
-        ui.add(
-            Slider::new(&mut self.db_hi, -80.0..=0.0)
-                .suffix(" dB")
-                .text("top"),
+        let c = DetectorConfig::det_v8(self.t1);
+        ui.label(
+            RichText::new(format!(
+                "window {} · lockout {} · warm-up {} frames",
+                c.window, c.lockout, c.warmup
+            ))
+            .small()
+            .weak(),
         );
-        ui.add(
-            Slider::new(&mut self.db_lo, -140.0..=-20.0)
-                .suffix(" dB")
-                .text("floor"),
-        );
-        if self.db_hi < self.db_lo + 10.0 {
-            self.db_lo = self.db_hi - 10.0;
+        if matches!(self.source, Source::Live) {
+            ui.label(
+                RichText::new("Live: a new threshold applies from now on.")
+                    .small()
+                    .weak(),
+            );
         }
+
+        ui.separator();
+        ui.heading("Timing");
+        egui::Grid::new("timing").num_columns(2).show(ui, |ui| {
+            if let Some((s, audio)) = self.timing.push {
+                ui.label("Last push");
+                ui.label(format!("{:.1} ms for {:.0} ms", s * 1e3, audio * 1e3));
+                ui.end_row();
+            }
+            let t = &self.timing;
+            ui.label("Stage two");
+            if t.stage_two_n > 0 {
+                ui.label(format!(
+                    "{} runs, mean {:.1} ms, max {:.1}",
+                    t.stage_two_n,
+                    t.stage_two_sum / t.stage_two_n as f64 * 1e3,
+                    t.stage_two_max * 1e3
+                ));
+            } else {
+                ui.label("—");
+            }
+            ui.end_row();
+            if let (Source::Live, Some(input)) = (&self.source, &self.input) {
+                let dropped = input.stats.dropped() - self.dropped_at_start;
+                if dropped > 0 {
+                    ui.label(RichText::new("Dropped").color(Color32::LIGHT_RED));
+                    ui.label(
+                        RichText::new(format!("{dropped} mic samples")).color(Color32::LIGHT_RED),
+                    )
+                    .on_hover_text(
+                        "The window was not drawn for a while; the stream has a gap there",
+                    );
+                    ui.end_row();
+                }
+            }
+        });
+
+        if let Source::File {
+            path,
+            channel,
+            channels,
+            source_rate,
+            progress,
+        } = &self.source
+        {
+            let (path, mut ch, channels, source_rate, done) = (
+                path.clone(),
+                *channel,
+                *channels,
+                *source_rate,
+                progress.is_none(),
+            );
+            ui.separator();
+            ui.heading("File");
+            ui.label(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .on_hover_text(path.display().to_string());
+            if done {
+                ui.label(format!(
+                    "{:.1} s · {} Hz{}",
+                    self.timeline.duration(),
+                    source_rate,
+                    if source_rate != self.timeline.sample_rate {
+                        format!(" → {} Hz", self.timeline.sample_rate)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            if channels > 1 {
+                egui::ComboBox::from_label("Channel")
+                    .selected_text(ch.to_string())
+                    .show_ui(ui, |ui| {
+                        for c in 0..channels {
+                            ui.selectable_value(&mut ch, c, c.to_string());
+                        }
+                    });
+                if ch != *channel {
+                    self.open_file(path.clone(), ch);
+                }
+            }
+            if ui
+                .add_enabled(
+                    done && self.one.is_some(),
+                    egui::Button::new("Export JSONL…"),
+                )
+                .on_hover_text("One line per trigger, as `kws stream` writes them")
+                .clicked()
+            {
+                self.export(&path, channels, ch);
+            }
+        }
+
+        ui.separator();
+        ui.heading("View");
+        ui.add(
+            Slider::new(&mut self.view.span, 1.0..=120.0)
+                .text("seconds")
+                .logarithmic(true)
+                .fixed_decimals(1),
+        );
+        ui.add(Slider::new(&mut self.db_lo, -160.0..=-40.0).text("dB floor"));
+        ui.add(Slider::new(&mut self.db_hi, -60.0..=0.0).text("dB ceiling"));
+        self.db_hi = self.db_hi.max(self.db_lo + 10.0);
         let before = self.colormap;
         egui::ComboBox::from_label("Colormap")
             .selected_text(self.colormap.name())
@@ -411,210 +785,106 @@ impl App {
         if self.colormap != before {
             self.lut = self.colormap.lut();
         }
-        let vsync = self.perf.vsync.value();
-        let rate_name = |r: Option<u32>| match (r, vsync) {
-            (Some(fps), _) => format!("{fps} fps"),
-            (None, Some(dt)) => format!("Display ({:.0} Hz)", 1.0 / dt),
-            (None, None) => "Display".into(),
-        };
-        egui::ComboBox::from_label("Frame rate")
-            .selected_text(rate_name(self.max_fps))
-            .show_ui(ui, |ui| {
-                for r in FRAME_RATES {
-                    ui.selectable_value(&mut self.max_fps, r, rate_name(r));
-                }
-            })
-            .response
-            .on_hover_text(format!(
-                "Display follows the monitor refresh rate (measured). \
-                 Input below the level gate for {:.1} s drops to {QUIET_FPS:.0} fps; \
-                 while paused the view redraws only on mouse or keyboard input",
-                QUIET_HOLD.as_secs_f32()
-            ));
 
-        ui.separator();
-        ui.heading("Pitch & scale");
-        ui.add(
-            Slider::new(&mut self.level_gate, -120.0..=0.0)
-                .suffix(" dB")
-                .text("level gate"),
-        )
-        .on_hover_text(
-            "Frames below this level get no pitch and no peak marker; \
-             a quiet input also lowers the frame rate (see Frame rate)",
-        );
-        ui.checkbox(&mut self.show_pitch, "Pitch track");
-        egui::ComboBox::from_label("Scale")
-            .selected_text(self.scale.map_or("Off", Scale::name))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.scale, None, "Off");
-                for s in Scale::ALL {
-                    ui.selectable_value(&mut self.scale, Some(s), s.name());
-                }
-            });
-        egui::ComboBox::from_label("Tonic")
-            .selected_text(NOTE_NAMES[self.tonic as usize])
-            .show_ui(ui, |ui| {
-                for (i, n) in NOTE_NAMES.iter().enumerate() {
-                    ui.selectable_value(&mut self.tonic, i as u8, *n);
-                }
-            });
-        ui.add(
-            Slider::new(&mut self.a4, 400.0..=480.0)
-                .step_by(0.5)
-                .suffix(" Hz")
-                .text("A4"),
-        );
-        ui.checkbox(&mut self.harmonics, "Harmonics on hover");
-
-        ui.separator();
-        self.perf_section(ui);
+        self.trigger_list(ui);
 
         ui.separator();
         self.updater.settings(ui);
-
         ui.separator();
-        ui.label(RichText::new("Space  pause / resume").small().weak());
+        ui.label(
+            RichText::new("Drag to pan · scroll to zoom · Space hold / follow")
+                .small()
+                .weak(),
+        );
     }
 
-    /// 没有输入时只跟界面事件；暂停时只需按时取走样本，让环形缓冲不溢出；
-    /// 电平持续低于门限时降帧；其余按帧率上限。
-    fn pace(&self) -> Pace {
-        if self.input.is_none() {
-            return Pace::Events;
+    fn trigger_list(&mut self, ui: &mut egui::Ui) {
+        if self.timeline.triggers.is_empty() {
+            return;
         }
-        if self.paused {
-            return Pace::Fps(4.0 / audio::RING_SECONDS);
-        }
-        let quiet = self.last_loud.is_none_or(|t| t.elapsed() > QUIET_HOLD);
-        match (quiet, self.max_fps.map(|f| f as f32)) {
-            (true, cap) => Pace::Fps(cap.map_or(QUIET_FPS, |c| c.min(QUIET_FPS))),
-            (false, Some(cap)) => Pace::Fps(cap),
-            (false, None) => Pace::Vsync,
-        }
-    }
-
-    fn latency(&self) -> Latency {
-        let sr = self.sample_rate;
-        let stats = self.input.as_ref().map(|i| &i.stats);
-        let device = match stats {
-            Some(st) if st.capture_us() > 0 => st.capture_us() as f32 * 1e-6,
-            Some(st) => st.block() as f32 / sr,
-            None => 0.0,
-        };
-        Latency {
-            device,
-            queue: 0.5 * self.perf.popped.get() / sr,
-            window: (0.5 * self.analysis.fft_size as f32 + self.perf.unframed.get()) / sr,
-            display: self.perf.frame.get(),
-        }
-    }
-
-    fn perf_section(&self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new(RichText::new("Performance").heading())
-            .default_open(true)
+        ui.separator();
+        ui.heading("Triggers");
+        let mut go = None;
+        egui::ScrollArea::vertical()
+            .id_salt("triggers")
+            .max_height(220.0)
             .show(ui, |ui| {
-                let p = &self.perf;
-                let ms = |s: f32| format!("{:5.1} ms", s * 1e3);
-                let frame = p.frame.get();
-                let audio_per_frame = p.popped.get() / self.sample_rate;
-                let pct = |num: f32, den: f32| {
-                    if den > 0.0 {
-                        format!("{:4.1} %", 100.0 * num / den)
-                    } else {
-                        "—".into()
+                for (i, t) in self.timeline.triggers.iter().enumerate().rev() {
+                    let mark = if t.accepted { "✔" } else { "✖" };
+                    let logit = t
+                        .stage_two_logit
+                        .map(|l| format!("{l:+.2}"))
+                        .unwrap_or_default();
+                    let text = RichText::new(format!(
+                        "{mark} {:>8.2} s  {:.3}  {logit}",
+                        self.timeline.seconds(t.end_sample),
+                        t.score
+                    ))
+                    .monospace()
+                    .color(if t.accepted { GREEN } else { RED });
+                    if ui
+                        .selectable_label(self.selected == Some(i), text)
+                        .clicked()
+                    {
+                        go = Some(i);
                     }
-                };
-                let lat = self.latency();
-                let block = self.input.as_ref().map_or(0, |i| i.stats.block());
-                let dropped = self.input.as_ref().map_or(0, |i| i.stats.dropped());
-                let rows: [(&str, String, String, &str); 10] = [
-                    (
-                        "fps",
-                        format!("{:5.1}", if frame > 0.0 { 1.0 / frame } else { 0.0 }),
-                        ms(frame),
-                        "Frames per second and frame interval",
-                    ),
-                    (
-                        "frame cpu",
-                        ms(p.cpu.get()),
-                        pct(p.cpu.get(), frame),
-                        "UI thread time per frame (update + paint, excluding vsync wait) \
-                         and its share of the frame interval",
-                    ),
-                    (
-                        "  colorize",
-                        ms(p.colorize.get()),
-                        String::new(),
-                        "Colouring new waterfall columns and uploading them to the texture; \
-                         a colormap or dB range change repaints the whole image once",
-                    ),
-                    (
-                        "  dsp",
-                        ms(p.dsp.get()),
-                        format!("{:3.0} col", p.cols.get()),
-                        "STFT + YIN + waterfall write per frame, and columns produced",
-                    ),
-                    (
-                        "dsp load",
-                        pct(p.dsp.get(), audio_per_frame),
-                        String::new(),
-                        "DSP time as a share of the audio it processed (100 % = cannot keep up)",
-                    ),
-                    (
-                        "latency ≈",
-                        ms(lat.total()),
-                        String::new(),
-                        "Estimated sound-to-screen delay to the centre of the newest column",
-                    ),
-                    (
-                        "  device",
-                        ms(lat.device),
-                        format!("{block} smp"),
-                        "Capture to callback as reported by the driver, and the callback block size",
-                    ),
-                    (
-                        "  queue",
-                        ms(lat.queue),
-                        String::new(),
-                        "Average wait in the ring buffer until the next UI frame picks samples up",
-                    ),
-                    (
-                        "  window",
-                        ms(lat.window),
-                        String::new(),
-                        "Half the FFT window plus samples not yet in a column; \
-                         shrink FFT size to cut it",
-                    ),
-                    (
-                        "  display",
-                        ms(lat.display),
-                        String::new(),
-                        "One frame from paint to scan-out",
-                    ),
-                ];
-                egui::Grid::new("perf")
-                    .num_columns(3)
-                    .spacing(vec2(8.0, 1.0))
-                    .show(ui, |ui| {
-                        let mono = |t: &str| RichText::new(t).monospace().small();
-                        for (name, value, extra, tip) in &rows {
-                            ui.label(mono(name).weak()).on_hover_text(*tip);
-                            ui.label(mono(value));
-                            ui.label(mono(extra).weak());
-                            ui.end_row();
-                        }
-                        let dropped_text = mono(&dropped.to_string());
-                        ui.label(mono("dropped").weak())
-                            .on_hover_text("Samples lost because the ring buffer was full");
-                        ui.label(if dropped > 0 {
-                            dropped_text.color(Color32::LIGHT_RED)
-                        } else {
-                            dropped_text
-                        });
-                        ui.end_row();
-                    });
+                }
             });
+        if let Some(i) = go {
+            self.selected = Some(i);
+            let t = &self.timeline.triggers[i];
+            let mid = self.timeline.seconds((t.start_sample + t.end_sample) / 2);
+            self.view.end = mid + self.view.span / 2.0;
+            self.view.follow = false;
+        }
+    }
+
+    fn export(&mut self, path: &std::path::Path, channels: usize, channel: usize) {
+        let name = format!(
+            "{}.triggers.jsonl",
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        let Some(out) = rfd::FileDialog::new()
+            .set_file_name(name)
+            .add_filter("JSON lines", &["jsonl"])
+            .save_file()
+        else {
+            return;
+        };
+        let wav = path.display().to_string();
+        // `kws stream` 只在点了声道时写 channel
+        let channel = (channels > 1).then_some(channel);
+        let mut text = String::new();
+        for t in &self.timeline.triggers {
+            text += &jsonl::line(&wav, t, channel);
+            text.push('\n');
+        }
+        if let Err(e) = std::fs::write(&out, text) {
+            self.error = Some(format!("{}: {e}", out.display()));
+        }
+    }
+
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        for path in dropped {
+            let ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if matches!(ext.as_str(), "wav" | "wave" | "flac") {
+                self.open_file(path, 0);
+            } else {
+                self.import(path);
+            }
+        }
     }
 
     fn central(&mut self, ctx: &egui::Context) {
@@ -622,298 +892,399 @@ impl App {
             .frame(egui::Frame::none().fill(BG))
             .show(ctx, |ui| {
                 let full = ui.available_rect_before_wrap();
-                let resp = ui.allocate_rect(full, Sense::hover());
+                let plot = Rect::from_min_max(pos2(full.left() + HZ_GUTTER, full.top()), full.max);
                 let spec = Rect::from_min_max(
-                    pos2(full.left() + HZ_GUTTER, full.top() + 8.0),
-                    pos2(full.right() - NOTE_GUTTER - LIVE_W, full.bottom() - 8.0),
+                    plot.min,
+                    pos2(plot.right(), plot.bottom() - SCORE_H - AXIS_H),
                 );
-                let live = Rect::from_min_max(
-                    pos2(full.right() - LIVE_W, spec.top()),
-                    pos2(full.right() - 8.0, spec.bottom()),
+                let score = Rect::from_min_max(
+                    pos2(plot.left(), spec.bottom() + 4.0),
+                    pos2(plot.right(), plot.bottom() - AXIS_H),
                 );
-                if spec.width() < 50.0 || spec.height() < 50.0 {
-                    return;
-                }
+                let axis = Rect::from_min_max(pos2(plot.left(), score.bottom()), plot.max);
+
+                let response = ui.allocate_rect(plot, Sense::click_and_drag());
+                self.navigate(ui, &response, plot);
+
                 let painter = ui.painter_at(full);
-
-                let tex_id = self.update_texture(ctx);
-                // 纹理按槽位存列，从最老的槽位起绕回一圈（REPEAT）。两端各收半个
-                // 纹素，线性插值不会把最新一列和最老一列混在一起。
-                let cols = self.waterfall.cols() as f32;
-                let head = self.waterfall.head() as f32;
-                let uv = Rect::from_min_max(
-                    pos2((head + 0.5) / cols, 0.0),
-                    pos2((head + cols - 0.5) / cols, 1.0),
-                );
-                painter.image(tex_id, spec, uv, Color32::WHITE);
-
-                self.draw_freq_ticks(&painter, spec);
-                self.draw_scale(&painter, spec);
-                if self.show_pitch {
-                    self.draw_pitch(&painter, spec);
+                let texture = self.update_texture(ctx, spec.width());
+                let (t0, t1) = self.window();
+                if let Some((id, lo, hi)) = texture {
+                    let x = |t: f64| spec.left() + ((t - t0) / (t1 - t0)) as f32 * spec.width();
+                    let s = &self.timeline.spec;
+                    let half = 0.5;
+                    let r = Rect::from_x_y_ranges(
+                        x(s.time_of(lo as f64 - half))..=x(s.time_of(hi as f64 - half)),
+                        spec.y_range(),
+                    );
+                    painter.with_clip_rect(spec).image(
+                        id,
+                        r,
+                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
                 }
-                self.draw_live(&painter, live);
-                if let Some(p) = resp.hover_pos().filter(|p| spec.contains(*p)) {
-                    self.draw_hover(&painter, spec, p);
+                self.draw_freq_ticks(&painter, spec);
+                self.draw_triggers(&painter.with_clip_rect(spec), spec);
+                self.draw_scores(&painter, score);
+                self.draw_time_axis(&painter, axis, spec);
+                if let Some(p) = response.hover_pos() {
+                    self.draw_hover(&painter, spec, score, p);
                 }
             });
     }
 
-    /// 只给新写入的列着色并局部上传；色表或 dB 范围变了才整张重来。
-    fn update_texture(&mut self, ctx: &egui::Context) -> egui::TextureId {
-        let t0 = Instant::now();
-        let style = (self.colormap, self.db_lo, self.db_hi);
-        let mut dirty = self.waterfall.take_dirty();
-        if self.texture.is_none() || self.painted != Some(style) {
-            dirty = [0..self.waterfall.cols(), 0..0];
-            self.painted = Some(style);
+    /// 看得见的 [t0, t1] 秒。
+    fn window(&self) -> (f64, f64) {
+        (self.view.end - self.view.span, self.view.end)
+    }
+
+    fn navigate(&mut self, ui: &egui::Ui, response: &egui::Response, plot: Rect) {
+        let live = matches!(self.source, Source::Live);
+        let duration = self.timeline.duration();
+        if self.view.follow && live {
+            self.view.end = duration.max(self.view.span);
         }
-        for slots in dirty.into_iter().filter(|r| !r.is_empty()) {
-            let start = slots.start;
-            let image = self
-                .waterfall
-                .render(&self.lut, self.db_lo, self.db_hi, slots);
-            match &mut self.texture {
-                Some(t) => t.set_partial([start, 0], image, TEXTURE),
-                None => self.texture = Some(ctx.load_texture("waterfall", image, TEXTURE)),
+        let per_px = self.view.span / plot.width().max(1.0) as f64;
+        if response.dragged() {
+            self.view.end -= response.drag_delta().x as f64 * per_px;
+            self.view.follow = false;
+        }
+        if response.hovered() {
+            let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta()));
+            if scroll.x != 0.0 {
+                self.view.end -= scroll.x as f64 * per_px;
+                self.view.follow = false;
+            }
+            let factor = (-(scroll.y as f64) * 0.004).exp() / zoom as f64;
+            if factor != 1.0 {
+                let at = response.hover_pos().map_or(self.view.end, |p| {
+                    self.view.end - (plot.right() - p.x) as f64 * per_px
+                });
+                let span = (self.view.span * factor).clamp(0.5, 600.0);
+                // 指针下的那一刻不动
+                self.view.end = at + (self.view.end - at) * span / self.view.span;
+                self.view.span = span;
+                if !live || !self.view.follow {
+                    self.view.follow = false;
+                }
             }
         }
-        self.perf.colorize.add(t0.elapsed().as_secs_f32());
-        self.texture.as_ref().expect("painted above").id()
+        if response.double_clicked() && live {
+            self.view.follow = true;
+        }
+        let lo = self.view.span.min(duration.max(self.view.span));
+        let hi = duration.max(self.view.span);
+        self.view.end = self.view.end.clamp(lo, hi);
+    }
+
+    /// 只着色看得见的列；返回纹理和它盖住的列 [lo, hi)。
+    fn update_texture(
+        &mut self,
+        ctx: &egui::Context,
+        width: f32,
+    ) -> Option<(egui::TextureId, usize, usize)> {
+        let s = &self.timeline.spec;
+        let (t0, t1) = self.window();
+        let lo = s.column_at(t0).floor().max(0.0) as usize;
+        let hi = (s.column_at(t1).ceil().max(0.0) as usize + 1).max(lo + 1);
+        let w = ((width as usize).max(1) * 2).min(MAX_TEXTURE_W);
+        let key = (
+            lo,
+            hi,
+            w,
+            s.end().min(hi),
+            self.colormap,
+            self.db_lo,
+            self.db_hi,
+        );
+        if self.painted != Some(key) {
+            let image = s.render(&self.lut, self.db_lo, self.db_hi, lo, hi, w);
+            match &mut self.texture {
+                Some(t) => t.set(image, TextureOptions::LINEAR),
+                None => {
+                    self.texture =
+                        Some(ctx.load_texture("spectrogram", image, TextureOptions::LINEAR))
+                }
+            }
+            self.painted = Some(key);
+        }
+        Some((self.texture.as_ref()?.id(), lo, hi))
+    }
+
+    fn time_x(&self, rect: Rect, t: f64) -> f32 {
+        let (t0, t1) = self.window();
+        rect.left() + ((t - t0) / (t1 - t0)) as f32 * rect.width()
+    }
+
+    fn x_time(&self, rect: Rect, x: f32) -> f64 {
+        let (t0, t1) = self.window();
+        t0 + ((x - rect.left()) / rect.width()) as f64 * (t1 - t0)
     }
 
     fn draw_freq_ticks(&self, painter: &Painter, spec: Rect) {
-        let stroke = Stroke::new(1.0_f32, Color32::from_gray(140));
-        for f in FREQ_TICKS {
-            if f < self.axis.f_min || f > self.axis.f_max {
-                continue;
-            }
-            let y = self.freq_y(spec, f);
-            painter.line_segment([pos2(spec.left() - 5.0, y), pos2(spec.left(), y)], stroke);
+        let axis = self.timeline.spec.axis;
+        for f in FREQ_TICKS
+            .into_iter()
+            .filter(|&f| f >= axis.f_min && f <= axis.f_max)
+        {
+            let y = spec.bottom() - axis.unit_of(f) * spec.height();
+            painter.line_segment(
+                [pos2(spec.left() - 4.0, y), pos2(spec.left(), y)],
+                Stroke::new(1.0f32, Color32::GRAY),
+            );
             let label = if f >= 1e3 {
                 format!("{}k", f / 1e3)
             } else {
                 format!("{f}")
             };
             painter.text(
-                pos2(spec.left() - 7.0, y),
+                pos2(spec.left() - 6.0, y),
                 Align2::RIGHT_CENTER,
                 label,
-                FontId::monospace(11.0),
-                Color32::from_gray(170),
+                FontId::proportional(11.0),
+                Color32::GRAY,
             );
         }
     }
 
-    fn draw_scale(&self, painter: &Painter, spec: Rect) {
-        let Some(scale) = self.scale else {
-            return;
-        };
-        let lines =
-            music::scale_lines(scale, self.tonic, self.a4, self.axis.f_min, self.axis.f_max);
-        for l in &lines {
-            let y = self.freq_y(spec, l.freq);
-            let color = if l.is_tonic {
-                Color32::from_rgba_unmultiplied(255, 214, 102, 130)
+    fn draw_triggers(&self, painter: &Painter, spec: Rect) {
+        let tl = &self.timeline;
+        let (t0, t1) = self.window();
+        for (i, t) in tl.triggers.iter().enumerate() {
+            let (a, b) = (tl.seconds(t.start_sample), tl.seconds(t.end_sample));
+            let lead = t.stage_two_from.map(|s| tl.seconds(s)).unwrap_or(a);
+            if b < t0 || lead.min(a) > t1 {
+                continue;
+            }
+            let (xa, xb) = (self.time_x(spec, a), self.time_x(spec, b));
+            let body = Rect::from_x_y_ranges(xa..=xb, spec.y_range());
+            let color = if t.accepted { GREEN } else { RED };
+            if t.accepted {
+                if lead < a {
+                    let r = Rect::from_x_y_ranges(self.time_x(spec, lead)..=xa, spec.y_range());
+                    painter.rect_filled(r, 0.0, GREEN.gamma_multiply(0.12));
+                }
+                painter.rect_filled(body, 0.0, GREEN.gamma_multiply(0.32));
             } else {
-                Color32::from_rgba_unmultiplied(200, 220, 255, 45)
-            };
-            painter.line_segment(
-                [pos2(spec.left(), y), pos2(spec.right(), y)],
-                Stroke::new(1.0_f32, color),
-            );
-        }
-        // 主音标签优先占位，其余音名在不挤的地方补上
-        let mut taken: Vec<f32> = Vec::new();
-        for tonic_pass in [true, false] {
-            for l in lines.iter().filter(|l| l.is_tonic == tonic_pass) {
-                let y = self.freq_y(spec, l.freq);
-                if taken.iter().any(|t| (t - y).abs() < LABEL_SPACING) {
-                    continue;
-                }
-                taken.push(y);
-                painter.text(
-                    pos2(spec.right() + 5.0, y),
-                    Align2::LEFT_CENTER,
-                    music::note_name(l.midi),
-                    FontId::monospace(10.5),
-                    if l.is_tonic {
-                        AMBER
-                    } else {
-                        Color32::from_gray(170)
-                    },
-                );
-            }
-        }
-    }
-
-    fn draw_pitch(&self, painter: &Painter, spec: Rect) {
-        let cols = self.waterfall.cols();
-        let mut track: Vec<Pos2> = Vec::new();
-        let mut prev: Option<f32> = None;
-        for x in 0..cols {
-            let f = self
-                .waterfall
-                .pitch_at(x)
-                .filter(|f| (self.axis.f_min..=self.axis.f_max).contains(f));
-            let jump = matches!((prev, f), (Some(a), Some(b)) if 12.0 * (b / a).log2().abs() > MAX_TRACK_JUMP);
-            if f.is_none() || jump {
-                stroke_track(painter, &mut track);
-            }
-            if let Some(f) = f {
-                let px = spec.left() + (x as f32 + 0.5) / cols as f32 * spec.width();
-                track.push(pos2(px, self.freq_y(spec, f)));
-            }
-            prev = f;
-        }
-        stroke_track(painter, &mut track);
-    }
-
-    fn draw_live(&self, painter: &Painter, live: Rect) {
-        painter.rect_filled(live, 2.0, Color32::from_gray(20));
-        let col = self.waterfall.mapped_column(self.waterfall.cols() - 1);
-        let rows = self.waterfall.rows() as f32;
-        let span = self.db_hi - self.db_lo;
-        let points: Vec<Pos2> = col
-            .iter()
-            .enumerate()
-            .map(|(r, &db)| {
-                let t = ((db - self.db_lo) / span).clamp(0.0, 1.0);
-                pos2(
-                    live.left() + t * live.width(),
-                    live.top() + (r as f32 + 0.5) / rows * live.height(),
-                )
-            })
-            .collect();
-        painter.add(Shape::line(points, Stroke::new(1.0_f32, CYAN)));
-
-        // 琥珀：最强频率；绿：音高。泛音比基音响时两者会差一个或几个八度
-        if let Some((f, _)) = self.gated_peak() {
-            let y = self.freq_y(live, f);
-            painter.line_segment(
-                [pos2(live.left(), y), pos2(live.right(), y)],
-                Stroke::new(1.0_f32, AMBER),
-            );
-        }
-        if let Some(f) = self.waterfall.pitch_at(self.waterfall.cols() - 1) {
-            let y = self.freq_y(live, f);
-            painter.line_segment(
-                [pos2(live.left(), y), pos2(live.right(), y)],
-                Stroke::new(1.5_f32, GREEN),
-            );
-        }
-    }
-
-    fn draw_hover(&self, painter: &Painter, spec: Rect, p: Pos2) {
-        let f = self.y_freq(spec, p.y);
-        let cross = Stroke::new(1.0_f32, Color32::from_white_alpha(70));
-        painter.line_segment([pos2(spec.left(), p.y), pos2(spec.right(), p.y)], cross);
-        painter.line_segment([pos2(p.x, spec.top()), pos2(p.x, spec.bottom())], cross);
-
-        if self.harmonics {
-            let stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 140, 60, 150));
-            for k in 2..=MAX_HARMONIC {
-                let fk = f * k as f32;
-                if fk > self.axis.f_max {
-                    break;
-                }
-                let y = self.freq_y(spec, fk);
+                let r = body.shrink(1.0);
+                let corners = [
+                    r.left_top(),
+                    r.right_top(),
+                    r.right_bottom(),
+                    r.left_bottom(),
+                    r.left_top(),
+                ];
                 painter.extend(Shape::dashed_line(
-                    &[pos2(spec.left(), y), pos2(spec.right(), y)],
-                    stroke,
-                    6.0,
-                    4.0,
+                    &corners,
+                    Stroke::new(2.0f32, RED),
+                    8.0,
+                    5.0,
                 ));
+            }
+            if self.selected == Some(i) {
+                painter.rect_stroke(body, 0.0, Stroke::new(1.5f32, Color32::WHITE));
+            }
+            let label = match t.stage_two_logit {
+                Some(l) => format!("{l:+.2}"),
+                None => format!("{:.2}", t.score),
+            };
+            let at = pos2((xa + xb) / 2.0, spec.top() + 4.0);
+            let galley = painter.layout_no_wrap(label, FontId::monospace(13.0), color);
+            let bg = Rect::from_center_size(
+                at + vec2(0.0, galley.size().y / 2.0),
+                galley.size() + vec2(6.0, 2.0),
+            );
+            painter.rect_filled(bg, 3.0, Color32::from_black_alpha(170));
+            painter.galley(bg.min + vec2(3.0, 1.0), galley, color);
+        }
+    }
+
+    fn draw_scores(&self, painter: &Painter, score: Rect) {
+        painter.rect_filled(score, 0.0, Color32::from_gray(20));
+        let y = |p: f32| score.bottom() - p.clamp(0.0, 1.0) * score.height();
+        let tl = &self.timeline;
+        // 触发的区间在分数图上也淡淡地画出来
+        for t in &tl.triggers {
+            let xa = self.time_x(score, tl.seconds(t.start_sample));
+            let xb = self.time_x(score, tl.seconds(t.end_sample));
+            let color = if t.accepted { GREEN } else { RED };
+            painter.with_clip_rect(score).rect_filled(
+                Rect::from_x_y_ranges(xa..=xb, score.y_range()),
+                0.0,
+                color.gamma_multiply(0.15),
+            );
+        }
+        if tl.keywords.is_empty() {
+            painter.text(
+                score.center(),
+                Align2::CENTER_CENTER,
+                "Import a stage-one bundle to see its score",
+                FontId::proportional(13.0),
+                Color32::GRAY,
+            );
+            return;
+        }
+        let t1y = y(self.t1 as f32);
+        painter.extend(Shape::dashed_line(
+            &[pos2(score.left(), t1y), pos2(score.right(), t1y)],
+            Stroke::new(1.0f32, AMBER),
+            6.0,
+            4.0,
+        ));
+        painter.text(
+            pos2(score.left() - 6.0, t1y),
+            Align2::RIGHT_CENTER,
+            format!("t1 {:.2}", self.t1),
+            FontId::proportional(10.0),
+            AMBER,
+        );
+        for p in [0.0, 1.0] {
+            painter.text(
+                pos2(score.left() - 6.0, y(p)),
+                Align2::RIGHT_CENTER,
+                format!("{p:.0}"),
+                FontId::proportional(10.0),
+                Color32::GRAY,
+            );
+        }
+        // 每个像素至多一个点：区间里取最大，峰不会被抽掉
+        let (t0, t1) = self.window();
+        let frame_at = |t: f64| (t * tl.sample_rate as f64 - tl.n_fft as f64) / tl.hop as f64;
+        let lo = frame_at(t0).floor().max(tl.first_frame as f64) as usize;
+        let hi = (frame_at(t1).ceil().max(0.0) as usize + 1).min(tl.frame_end());
+        if hi <= lo {
+            return;
+        }
+        let per_px = ((hi - lo) as f32 / score.width()).max(1.0) as usize;
+        let colors = [
+            CYAN,
+            Color32::from_rgb(255, 140, 220),
+            Color32::from_rgb(180, 255, 120),
+        ];
+        for index in 0..tl.keywords.len() {
+            let mut points = Vec::with_capacity((hi - lo) / per_px + 1);
+            let mut f = lo;
+            while f < hi {
+                let end = (f + per_px).min(hi);
+                let p = (f..end)
+                    .filter_map(|j| tl.prob(j, index))
+                    .fold(0.0f32, f32::max);
+                points.push(pos2(self.time_x(score, tl.frame_time(f)), y(p)));
+                f = end;
+            }
+            painter.with_clip_rect(score).add(Shape::line(
+                points,
+                Stroke::new(1.5f32, colors[index % colors.len()]),
+            ));
+        }
+        if tl.keywords.len() > 1 {
+            for (index, k) in tl.keywords.iter().enumerate() {
                 painter.text(
-                    pos2(p.x + 4.0, y - 1.0),
-                    Align2::LEFT_BOTTOM,
-                    format!("×{k}"),
-                    FontId::monospace(10.0),
-                    stroke.color,
+                    score.right_top() + vec2(-6.0, 4.0 + 14.0 * index as f32),
+                    Align2::RIGHT_TOP,
+                    k,
+                    FontId::proportional(11.0),
+                    colors[index % colors.len()],
                 );
             }
         }
-
-        let cols = self.waterfall.cols();
-        let rows = self.waterfall.rows();
-        let x = (((p.x - spec.left()) / spec.width() * cols as f32) as usize).min(cols - 1);
-        let r = (((p.y - spec.top()) / spec.height() * rows as f32) as usize).min(rows - 1);
-        let db = self.waterfall.mapped_column(x)[r];
-        let age = (cols - 1 - x) as f32 * self.analysis.hop as f32 / self.sample_rate;
-        let pitch = match self.waterfall.pitch_at(x) {
-            Some(pf) => format!("Pitch {}", self.note_text(pf)),
-            None => "Pitch —".into(),
-        };
-        let text = format!(
-            "{f:8.1} Hz\n{}\n{db:8.1} dB\n{age:8.2} s ago\n{pitch}",
-            self.note_text(f)
-        );
-
-        let galley = painter.layout_no_wrap(text, FontId::monospace(12.0), Color32::WHITE);
-        let size = galley.size();
-        let mut pos = p + vec2(14.0, 14.0);
-        if pos.x + size.x > spec.right() {
-            pos.x = p.x - 14.0 - size.x;
-        }
-        if pos.y + size.y > spec.bottom() {
-            pos.y = p.y - 14.0 - size.y;
-        }
-        painter.rect_filled(
-            Rect::from_min_size(pos, size).expand(5.0),
-            4.0,
-            Color32::from_black_alpha(210),
-        );
-        painter.galley(pos, galley, Color32::WHITE);
     }
-}
 
-/// 画一段音高轨迹（深色描边打底，任何色表上都看得清），然后清空。
-fn stroke_track(painter: &Painter, track: &mut Vec<Pos2>) {
-    match track.len() {
-        0 => {}
-        1 => {
-            painter.circle_filled(track[0], 1.5, GREEN);
+    fn draw_time_axis(&self, painter: &Painter, axis: Rect, spec: Rect) {
+        let (t0, t1) = self.window();
+        let px_per_s = axis.width() as f64 / (t1 - t0);
+        let step = TIME_STEPS
+            .into_iter()
+            .find(|s| s * px_per_s >= 90.0)
+            .unwrap_or(600.0);
+        let mut t = (t0 / step).ceil() * step;
+        while t <= t1 {
+            let x = self.time_x(axis, t);
+            painter.line_segment(
+                [pos2(x, spec.top()), pos2(x, axis.top())],
+                Stroke::new(1.0f32, Color32::from_white_alpha(14)),
+            );
+            let label = if step < 1.0 {
+                format!("{}:{:04.1}", (t / 60.0).floor(), t % 60.0)
+            } else {
+                format!("{}:{:02.0}", (t / 60.0).floor(), (t % 60.0).floor())
+            };
+            painter.text(
+                pos2(x, axis.top() + 3.0),
+                Align2::CENTER_TOP,
+                label,
+                FontId::proportional(11.0),
+                Color32::GRAY,
+            );
+            t += step;
         }
-        _ => {
-            painter.add(Shape::line(
-                track.clone(),
-                Stroke::new(4.0_f32, Color32::from_black_alpha(160)),
+    }
+
+    fn draw_hover(&self, painter: &Painter, spec: Rect, score: Rect, p: Pos2) {
+        let tl = &self.timeline;
+        let t = self.x_time(spec, p.x);
+        painter.line_segment(
+            [pos2(p.x, spec.top()), pos2(p.x, score.bottom())],
+            Stroke::new(1.0f32, Color32::from_white_alpha(60)),
+        );
+        let mut lines = vec![format!("{t:.3} s")];
+        if spec.contains(p) {
+            let f = tl.spec.axis.freq_at((spec.bottom() - p.y) / spec.height());
+            lines.push(format!("{f:.0} Hz"));
+        }
+        if !tl.keywords.is_empty() {
+            let frame = ((t * tl.sample_rate as f64 - tl.n_fft as f64) / tl.hop as f64).round();
+            if frame >= 0.0 {
+                for (i, k) in tl.keywords.iter().enumerate() {
+                    if let Some(v) = tl.prob(frame as usize, i) {
+                        lines.push(format!("{k} {v:.3}"));
+                    }
+                }
+            }
+        }
+        let sample = (t.max(0.0) * tl.sample_rate as f64) as usize;
+        for tr in tl
+            .triggers
+            .iter()
+            .filter(|tr| tr.start_sample <= sample && sample <= tr.end_sample)
+        {
+            lines.push(format!(
+                "{} {} · frame {} · score {:.3}{}",
+                if tr.accepted { "accepted" } else { "rejected" },
+                tr.keyword,
+                tr.decision_frame,
+                tr.score,
+                tr.stage_two_logit
+                    .map(|l| format!(" · logit {l:+.3}"))
+                    .unwrap_or_default()
             ));
-            painter.add(Shape::line(track.clone(), Stroke::new(2.0_f32, GREEN)));
         }
+        let text = lines.join("\n");
+        let galley = painter.layout_no_wrap(text, FontId::monospace(12.0), Color32::WHITE);
+        let mut at = p + vec2(14.0, 14.0);
+        if at.x + galley.size().x > spec.right() {
+            at.x = p.x - 14.0 - galley.size().x;
+        }
+        let bg = Rect::from_min_size(at, galley.size()).expand(4.0);
+        painter.rect_filled(bg, 4.0, Color32::from_black_alpha(200));
+        painter.galley(at, galley, Color32::WHITE);
     }
-    track.clear();
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let start = Instant::now();
-        self.perf
-            .tick(frame.info().cpu_usage, self.pace == Pace::Vsync);
-        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.paused = !self.paused;
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) && matches!(self.source, Source::Live) {
+            self.view.follow = !self.view.follow;
         }
+        self.drain_replies();
         self.pump_audio();
-
-        let (analysis, axis) = (self.analysis, self.axis);
+        self.handle_drops(ctx);
         self.top_bar(ctx);
-        self.settings_panel(ctx);
-        if self.analysis != analysis {
-            self.reset_analysis();
-        } else if self.axis != axis {
-            self.waterfall.set_map(self.row_map());
-        }
-
+        self.sidebar(ctx);
         self.central(ctx);
-        self.pace = self.pace();
-        match self.pace {
-            Pace::Vsync => ctx.request_repaint(),
-            Pace::Fps(fps) => {
-                // egui 会先从延迟里减去 predicted_dt（eframe 不更新它，恒为 1/60 s），加回去
-                let predicted = Duration::from_secs_f32(ctx.input(|i| i.predicted_dt));
-                ctx.request_repaint_after(self.perf.delay(fps, start.elapsed()) + predicted);
-            }
-            Pace::Events => {}
+        if self.input.is_some() {
+            ctx.request_repaint_after(LIVE_REPAINT);
         }
     }
 }

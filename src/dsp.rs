@@ -48,12 +48,6 @@ impl Stft {
         self.size / 2 + 1
     }
 
-    /// 最新一帧末尾之后、还没进入任何一帧的样本数。缓冲里另有 `size - hop`
-    /// 个样本与最新一帧重叠，它们已经算在那一列里。
-    pub fn unframed(&self) -> usize {
-        self.pending.len().saturating_sub(self.size - self.hop)
-    }
-
     /// 喂入任意长度的样本；每凑满一帧回调一次 `(dB 谱, 该帧未加窗的原始样本)`，
     /// 谱长度 `bins()`，样本长度为 FFT 大小。
     pub fn process(&mut self, samples: &[f32], mut on_frame: impl FnMut(&[f32], &[f32])) {
@@ -75,35 +69,6 @@ impl Stft {
         }
         self.pending.drain(..start);
     }
-}
-
-/// 均方根电平（dBFS，满幅正弦 ≈ −3 dB）。
-pub fn rms_db(x: &[f32]) -> f32 {
-    let ms = x.iter().map(|s| s * s).sum::<f32>() / x.len().max(1) as f32;
-    10.0 * ms.max(1e-16).log10()
-}
-
-/// 在 `[f_lo, f_hi]` 内找最强 bin，对 dB 做抛物线插值，返回 `(频率 Hz, dB)`。
-pub fn peak(db: &[f32], bin_hz: f32, f_lo: f32, f_hi: f32) -> Option<(f32, f32)> {
-    let lo = ((f_lo / bin_hz).ceil() as usize).max(1);
-    let hi = ((f_hi / bin_hz).floor() as usize).min(db.len().checked_sub(2)?);
-    if lo > hi {
-        return None;
-    }
-    let k = lo
-        + db[lo..=hi]
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))?
-            .0;
-    let (a, b, c) = (db[k - 1], db[k], db[k + 1]);
-    let denom = a - 2.0 * b + c;
-    let delta = if denom.abs() > 1e-9 {
-        0.5 * (a - c) / denom
-    } else {
-        0.0
-    };
-    Some(((k as f32 + delta) * bin_hz, b - 0.25 * (a - c) * delta))
 }
 
 #[cfg(test)]
@@ -135,20 +100,6 @@ mod tests {
     }
 
     #[test]
-    fn peak_interpolates_between_bins() {
-        let bin_hz = SR / N as f32;
-        for frac in [0.0, 0.25, 0.37, 0.5, 0.8] {
-            let f = (200.0 + frac) * bin_hz;
-            let db = first_frame(&sine(f, 0.3, N));
-            let (est, _) = peak(&db, bin_hz, 50.0, 8_000.0).unwrap();
-            assert!(
-                (est - f).abs() < 0.1 * bin_hz,
-                "frac {frac}: est {est} vs {f}"
-            );
-        }
-    }
-
-    #[test]
     fn chunked_input_matches_one_shot() {
         let signal: Vec<f32> = sine(440.0, 0.4, 20_000)
             .iter()
@@ -164,10 +115,6 @@ mod tests {
             frames
         };
         let whole = run(signal.len());
-        let mut stft = Stft::new(1024, 256);
-        stft.process(&signal, |_, _| {});
-        let framed_end = (whole.len() - 1) * 256 + 1024;
-        assert_eq!(stft.unframed(), signal.len() - framed_end);
         assert_eq!(whole.len(), (signal.len() - 1024) / 256 + 1);
         assert_eq!(whole, run(37));
     }
