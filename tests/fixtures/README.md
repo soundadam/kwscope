@@ -37,4 +37,4 @@ uv run --frozen --no-sync python $F/make_fixtures.py $F
 ## 容差
 
 特征在 1e-4 内（两边都是 f64 算、转 f32，只差在求和次序），网络输出在 1e-3 内（同一张图，
-不同的 ORT 构建）。触发的整数与布尔字段必须逐字相同，`score` 在 1e-5 内。
+不同的 ORT 构建）。触发的整数与布尔字段必须逐字相同，`score` 在 1e-5 内；只有 `start_sample` 例外，它是回归偏移乘 hop 再取整，偏移在 1e-3 内时可差一个样本。
