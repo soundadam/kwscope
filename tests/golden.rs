@@ -127,7 +127,6 @@ fn assert_triggers(got: &[Trigger], want: &[Value], what: &str) {
             "keyword",
             "arm_frame",
             "decision_frame",
-            "start_sample",
             "end_sample",
             "accepted",
         ] {
@@ -137,6 +136,12 @@ fn assert_triggers(got: &[Trigger], want: &[Value], what: &str) {
             let (a, b) = (line[key].as_f64().unwrap(), w[key].as_f64().unwrap());
             assert!((a - b).abs() < tol, "{at}: {key} {a} against {b}");
         };
+        // 起点由网络回归的偏移取整而来：偏移差在 LOGIT_TOL 内，取整后至多差一个样本
+        let (a, b) = (
+            line["start_sample"].as_i64().unwrap(),
+            w["start_sample"].as_i64().unwrap(),
+        );
+        assert!((a - b).abs() <= 1, "{at}: start_sample {a} against {b}");
         close("score", SCORE_TOL);
         close("start_offset_frames", LOGIT_TOL * 131.0);
         close("stage_two_logit", LOGIT_TOL);
