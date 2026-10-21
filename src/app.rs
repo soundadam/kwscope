@@ -18,8 +18,8 @@ use std::time::Duration;
 /// kws-train 台账上一级 12 FA/h 的阈值与二级的现役阈值。
 pub const DEFAULT_T1: f64 = 0.33140625;
 pub const DEFAULT_T2: f64 = 1.2;
-/// 直播留多久的图、分与触发。
-const LIVE_KEEP_S: f64 = 300.0;
+/// 直播只留这么久的图、分与触发：环形的，更早的直接丢掉，触发只留个数。
+const LIVE_KEEP_S: f64 = 30.0;
 const COPYRIGHT_YEAR: u32 = 2026;
 /// 直播时的重画间隔：麦克风环形缓冲按这个节奏取。
 const LIVE_REPAINT: Duration = Duration::from_millis(33);
@@ -50,6 +50,8 @@ struct Timeline {
     /// `probs` 第一帧是开机以来第几帧。
     first_frame: usize,
     triggers: Vec<Trigger>,
+    /// 已经从直播的环里丢掉的触发：（全部，收下的）。
+    gone: (usize, usize),
     /// 直播暂停又继续处的样本号：停着的那段剪掉了，前后拼在一起。
     splices: Vec<usize>,
 }
@@ -66,6 +68,7 @@ impl Timeline {
             probs: vec![],
             first_frame: 0,
             triggers: vec![],
+            gone: (0, 0),
             splices: vec![],
         }
     }
@@ -105,7 +108,19 @@ impl Timeline {
         self.probs.get(j * self.k() + index).copied()
     }
 
-    fn trim(&mut self) {
+    /// 开机以来的（触发，收下的），丢掉的也算。
+    fn counts(&self) -> (usize, usize) {
+        let accepted = self.triggers.iter().filter(|t| t.accepted).count();
+        (self.gone.0 + self.triggers.len(), self.gone.1 + accepted)
+    }
+
+    /// 留得住的最早一刻。
+    fn start(&self) -> f64 {
+        (self.duration() - LIVE_KEEP_S).max(0.0)
+    }
+
+    /// 丢掉 `LIVE_KEEP_S` 之前的一切；返回丢了几个触发（它们在 `triggers` 的最前面）。
+    fn trim(&mut self) -> usize {
         let keep_cols = (LIVE_KEEP_S / crate::spectrogram::HOP_S) as usize;
         self.spec.trim(keep_cols);
         let k = self.k();
@@ -119,8 +134,17 @@ impl Timeline {
         let horizon = self
             .samples
             .saturating_sub((LIVE_KEEP_S * self.sample_rate as f64) as usize);
-        self.triggers.retain(|t| t.end_sample >= horizon);
+        let drop = self
+            .triggers
+            .iter()
+            .take_while(|t| t.end_sample < horizon)
+            .count();
+        for t in self.triggers.drain(..drop) {
+            self.gone.0 += 1;
+            self.gone.1 += t.accepted as usize;
+        }
         self.splices.retain(|&s| s >= horizon);
+        drop
     }
 }
 
@@ -272,7 +296,7 @@ impl App {
         self.timing = Timing::default();
         self.selected = None;
         self.view.follow = true;
-        self.view.span = self.view.span.min(30.0);
+        self.view.span = self.view.span.min(LIVE_KEEP_S);
         // 重开设备：缓冲里的旧样本不是这条流的
         self.close_input();
         self.dropped = 0;
@@ -453,7 +477,8 @@ impl App {
                 samples,
             });
         }
-        self.timeline.trim();
+        let dropped = self.timeline.trim();
+        self.selected = self.selected.and_then(|i| i.checked_sub(dropped));
     }
 
     fn toggle_pause(&mut self) {
@@ -575,10 +600,9 @@ impl App {
     }
 
     fn counts(&self, ui: &mut egui::Ui) {
-        let t = &self.timeline.triggers;
-        let accepted = t.iter().filter(|t| t.accepted).count();
+        let (total, accepted) = self.timeline.counts();
         ui.label(
-            RichText::new(format!("Triggers {}", t.len()))
+            RichText::new(format!("Triggers {total}"))
                 .monospace()
                 .size(16.0)
                 .color(AMBER),
@@ -591,7 +615,7 @@ impl App {
                     .color(GREEN),
             );
             ui.label(
-                RichText::new(format!("Rejected {}", t.len() - accepted))
+                RichText::new(format!("Rejected {}", total - accepted))
                     .monospace()
                     .size(16.0)
                     .color(RED),
@@ -840,8 +864,10 @@ impl App {
 
         ui.separator();
         ui.heading("View");
+        let live = matches!(self.source, Source::Live { .. });
+        let longest = if live { LIVE_KEEP_S } else { 120.0 };
         ui.add(
-            Slider::new(&mut self.view.span, 1.0..=120.0)
+            Slider::new(&mut self.view.span, 1.0..=longest)
                 .text("seconds")
                 .logarithmic(true)
                 .fixed_decimals(1),
@@ -898,6 +924,16 @@ impl App {
         }
         ui.separator();
         ui.heading("Triggers");
+        let gone = self.timeline.gone.0;
+        if gone > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "Last {LIVE_KEEP_S:.0} s; {gone} older dropped (still counted above)"
+                ))
+                .small()
+                .weak(),
+            );
+        }
         let mut go = None;
         egui::ScrollArea::vertical()
             .id_salt("triggers")
@@ -1066,7 +1102,8 @@ impl App {
                 let at = response.hover_pos().map_or(self.view.end, |p| {
                     self.view.end - (plot.right() - p.x) as f64 * per_px
                 });
-                let span = (self.view.span * factor).clamp(0.5, 600.0);
+                let longest = if live { LIVE_KEEP_S } else { 600.0 };
+                let span = (self.view.span * factor).clamp(0.5, longest);
                 // 指针下的那一刻不动
                 self.view.end = at + (self.view.end - at) * span / self.view.span;
                 self.view.span = span;
@@ -1078,7 +1115,9 @@ impl App {
         if response.double_clicked() && live {
             self.view.follow = true;
         }
-        let lo = self.view.span.min(duration.max(self.view.span));
+        // 直播只能往回看到环里还留着的那段
+        let start = if live { self.timeline.start() } else { 0.0 };
+        let lo = (start + self.view.span).min(duration.max(self.view.span));
         let hi = duration.max(self.view.span);
         self.view.end = self.view.end.clamp(lo, hi);
     }
@@ -1405,5 +1444,54 @@ impl eframe::App for App {
         if self.input.is_some() {
             ctx.request_repaint_after(LIVE_REPAINT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trigger(end_sample: usize, accepted: bool) -> Trigger {
+        Trigger {
+            keyword: "k".into(),
+            arm_frame: 0,
+            decision_frame: 0,
+            score: 0.5,
+            start_offset_frames: 0.0,
+            start_sample: end_sample.saturating_sub(1600),
+            end_sample,
+            accepted,
+            stage_two_logit: None,
+            stage_two_from: None,
+            stage_two_seconds: None,
+        }
+    }
+
+    /// 开着几分钟，留下的只有最后 `LIVE_KEEP_S`，触发的个数照算。
+    #[test]
+    fn live_keeps_a_ring_and_counts_what_it_dropped() {
+        let rate = 16_000;
+        let mut tl = Timeline::new(rate, None);
+        let chunk = vec![0.0f32; rate as usize / 10];
+        let keep_cols = (LIVE_KEEP_S / crate::spectrogram::HOP_S) as usize;
+        let mut dropped = 0;
+        for i in 0..1800 {
+            tl.samples += chunk.len();
+            tl.spec.push(&chunk);
+            // 每秒一个，单数秒收下
+            if i % 10 == 9 {
+                let s = tl.samples / rate as usize;
+                tl.triggers.push(trigger(tl.samples, s % 2 == 1));
+            }
+            dropped += tl.trim();
+            let cols = tl.spec.end() - (0..tl.spec.end()).find(|&j| tl.spec.has_column(j)).unwrap();
+            assert!(cols <= keep_cols + keep_cols / 4 + 1);
+        }
+        assert_eq!(tl.counts(), (180, 90));
+        assert_eq!(tl.gone.0, dropped);
+        assert!(tl.triggers.len() <= LIVE_KEEP_S as usize + 1);
+        let horizon = tl.samples - (LIVE_KEEP_S * rate as f64) as usize;
+        assert!(tl.triggers.iter().all(|t| t.end_sample >= horizon));
+        assert_eq!(tl.start(), tl.duration() - LIVE_KEEP_S);
     }
 }
