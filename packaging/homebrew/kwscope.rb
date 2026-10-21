@@ -5,7 +5,7 @@ cask "kwscope" do
   version "@VERSION@"
 
   on_macos do
-    depends_on macos: ">= :ventura"
+    depends_on macos: :ventura
     depends_on arch: :arm64
 
     sha256 "@MACOS_SHA256@"
