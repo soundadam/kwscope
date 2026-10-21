@@ -1,6 +1,6 @@
 ---
 title: Kwscope
-excerpt: 唤醒词模型的测试台。导入 ONNX bundle，对着麦克风说或打开一段录音，每个触发都标在频谱上。
+excerpt: 语音唤醒模型的测试台。对着麦克风说一句唤醒词，看模型在哪一刻醒、为什么醒。
 weight: 40
 presentation:
   category: 语音 / macOS + Linux + Windows
@@ -18,8 +18,8 @@ release:
   license: MIT OR Apache-2.0
 modules:
   - type: promo
-    description: 拖进一个一级唤醒词 bundle，愿意的话再加一个二级检查器，然后对着麦克风说，或者打开一段 wav / flac。{title} 照训练侧自己的运行时跑两级，把每个触发标在对数频率的频谱上，下方是逐帧分数。
-    line: "{title} {version} 以 {license} 开源，用 Rust 写成，ONNX Runtime 静态链接，macOS、Linux、Windows 各一个原生可执行文件。"
+    description: 说一句“嘿 Siri”，手机就醒了，这一步叫[语音唤醒](https://machinelearning.apple.com/research/voice-trigger)（KWS）。{title} 是唤醒模型的测试台：对着麦克风说，或者打开一段录音，模型每一次醒来，都落在频谱上。
+    line: "{title} {version} 以 {license} 开源，眼下用在我们内部的唤醒模型测试上。不远的将来，我们会放出一个开源权重的唤醒模型，装上就能试。"
     actions:
       - label: 文档
         url: "{docs}"
@@ -27,36 +27,34 @@ modules:
         url: "https://github.com/{github}"
 
   - type: snapshot
-    title: 和训练侧一样的数
-    body: "{title} 读 kws-train 导出的 bundle，复现它的流式运行时：前端按 bundle 自带的表算，网络带缓存逐块前向，检测器和二级读的区间都一样。测试拿一段录音，把特征、logit 和触发逐帧对那边的运行时。"
-    note: 用哪个模型看 bundle json 的 format 字段，新的模型族就是多一个 adapter。
+    title: 看到的，就是模型真正的判断
+    body: 唤醒模型好不好，最后都落在一个个具体的时刻：该醒的时候醒没醒，不该醒的时候有没有误醒。{title} 和训练时用的运行时逐帧对齐，屏幕上的每一次触发，都是模型上线后真的会做出的判断，不是近似。
+    note: "{title} 本身不带模型。开源权重的唤醒模型发布后，会在这里给出下载。"
     metrics:
-      - value: "2"
-        label: bundle 格式：一级、二级
-      - value: "100 ms"
-        label: 每次推入，同 kws stream
-      - value: "16 kHz"
-        label: 输入重采样到 bundle 的采样率
+      - value: 两级
+        label: 一级听词，二级复核
+      - value: 逐帧
+        label: 和训练侧的运行时对齐
       - value: "{version}"
         label: "当前版本 · {license}"
 
   - type: section
-    title: 每个触发落在哪儿
+    title: 每一次醒来都有位置
     index: 1/3
-    lede: 收下的触发是一条绿底，盖住一级说是唤醒词的那段样本，二级往前多读的部分是更淡的绿；拒掉的是红色虚线框。每个都标着二级 logit，下方的分数曲线上能看到它越过的 t1 线。
+    lede: 绿色是收下的唤醒，红色虚线框是二级拦下的误报，上面的数字是二级的把握。下方是一级的分数曲线，越过黄色虚线的那一刻，模型醒了。
 
   - type: media
     image: triggers.webp
-    alt: Kwscope 打开一段 42 秒的朗读录音：收下的触发是绿色阴影，拒掉的是红色虚线框，上方标着二级 logit，下方是一级分数曲线和阈值线
-    caption: "在 Linux 上的 {title} {version} 里导入测试用的两个 bundle（权重未训练，触发本身没有意义）、打开 42 秒 THCHS-30 朗读录音：收下九个，拒掉两个。"
+    alt: Kwscope 在 MacBook Pro 上接麦克风：频谱上三段绿色阴影是收下的唤醒，一个红色虚线框是拦下的触发，上方标着二级 logit，下方是一级分数曲线和阈值线
+    caption: "{title} {version} 在 MacBook Pro 上接麦克风实测：四次触发，收下三次，二级拦下一次。"
 
   - type: section
-    title: 拖阈值，马上看结果
+    title: 拖一下阈值，就知道该定在哪儿
     index: 2/3
-    lede: 打开的录音上拖 t1 / t2 滑块立即重判，一级分数和二级 logit 都有缓存。时间轴可拖动、滚轮缩放，多声道文件可选声道，触发可导出成和 kws stream 一样的 JSON 行。
+    lede: 唤醒永远在两种失败之间取舍：太灵敏会误醒，太迟钝会叫不应。拖动 t1、t2，打开的录音马上重判一遍，哪一次多出来、哪一次消失了，一眼就能看到。
 
   - type: section
-    title: 实时，或者不开窗口
+    title: 在麦克风前，也在流水线里
     index: 3/3
-    lede: 接麦克风时频谱滚动，触发一出就标上，侧栏显示二级的耗时。不开窗口时用 kwscope stream 跑一批文件，每个触发打一行 JSON，可以直接和训练侧的输出比对。
+    lede: 最好的测试是自己开口说。接上麦克风，频谱随声音滚动，唤醒一出就标上。要成批跑录音时，用 `kwscope stream`，每个触发一行 JSON，直接接进评测。
 ---

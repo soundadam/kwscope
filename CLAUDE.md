@@ -6,6 +6,8 @@
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
+只改 `site/` 或 Markdown 的 commit 不用跑；CI 也只跑 `check`，跳过三平台测试。
+
 库（`src/lib.rs` → `kws`）：`adapter` 按 bundle json 的 `format` 选模型 → `stage_one` / `stage_two` 各一个格式，
 `frontend` 前端、`onnx` 会话、`npy` 读表 → `detector` det 检测器 → `engine` 两级串起来（流式 `Engine`、离线 `Analysis`）
 → `jsonl` 写 `kws stream` 的行；`media` 解码 wav/flac。
