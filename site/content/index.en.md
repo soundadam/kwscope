@@ -14,7 +14,7 @@ registry:
   homebrew: soundadam/tap/kwscope
   docs: https://github.com/soundadam/kwscope#readme
 release:
-  version: "0.1.0"
+  version: "0.2.0"
   license: MIT OR Apache-2.0
 modules:
   - type: promo
