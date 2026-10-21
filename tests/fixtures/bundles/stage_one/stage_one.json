@@ -1,0 +1,16 @@
+{
+  "cache_size": 8608,
+  "feature_dim": 40,
+  "format": "kws_stage_one.v1",
+  "hop_length": 160,
+  "keywords": [
+    "NIHAO_KAKA"
+  ],
+  "log_offset": 1e-06,
+  "n_fft": 512,
+  "receptive_field": 131,
+  "sample_rate": 16000,
+  "source": {
+    "weights": "random init, torch.manual_seed(1)"
+  }
+}

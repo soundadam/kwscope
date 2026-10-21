@@ -1,25 +1,25 @@
 ---
-title: Tonescope
-excerpt: A real-time spectrogram on a musical log-frequency axis, with scale lines and a pitch track drawn over the sound.
+title: Kwscope
+excerpt: A test bench for wake-word models. Import ONNX bundles, speak or open a recording, and see every trigger shaded on the spectrogram.
 weight: 40
 presentation:
-  category: Acoustics / macOS + Linux + Windows
+  category: Speech / macOS + Linux + Windows
   label: Install with Homebrew
   command:
     - brew trust --tap soundadam/tap
-    - brew install --cask soundadam/tap/tonescope
-  note: One executable. No account. Updates itself from GitHub Releases.
+    - brew install --cask soundadam/tap/kwscope
+  note: One executable. No models bundled. Updates itself from GitHub Releases.
 registry:
-  github: soundadam/tonescope
-  homebrew: soundadam/tap/tonescope
-  docs: https://github.com/soundadam/tonescope#readme
+  github: soundadam/kwscope
+  homebrew: soundadam/tap/kwscope
+  docs: https://github.com/soundadam/kwscope#readme
 release:
-  version: "0.1.2"
+  version: "0.1.0"
   license: MIT OR Apache-2.0
 modules:
   - type: promo
-    description: Sing, play or speak into the microphone and watch it as a waterfall on a log-frequency axis, where every octave is the same height and every note sits on its own scale line. {title} draws the pitch it hears as a line through the picture and reads it out as a note name and cents.
-    line: "{title} {version} is open source under {license}, a single native executable for macOS, Linux and Windows written in Rust."
+    description: Drop in a stage-one keyword-spotting bundle, and optionally a stage-two checker, then talk into the microphone or open a wav or flac file. {title} runs both stages the way the training side's own runtime does and marks each trigger on a log-frequency spectrogram, with the frame-by-frame score underneath.
+    line: "{title} {version} is open source under {license}, a single native executable for macOS, Linux and Windows written in Rust, with ONNX Runtime linked in."
     actions:
       - label: Docs (Chinese)
         url: "{docs}"
@@ -27,36 +27,36 @@ modules:
         url: "https://github.com/{github}"
 
   - type: snapshot
-    title: Why a log-frequency axis
-    body: A linear spectrogram spends half its height on the top octave and squeezes everything a voice or an instrument actually plays into a strip at the bottom. Musical pitch is logarithmic, so {title} gives each octave equal room, interpolates between FFT bins at the low end and takes the peak over each pixel row at the high end. Scale lines for the chosen key line up with the rows, so you read a note off the picture the way you read it off a keyboard.
-    note: The pitch track is YIN, measured from 40 to 2000 Hz. The smaller the FFT, the higher the lowest pitch it can measure; the sidebar shows the current limit.
+    title: The same numbers as the training side
+    body: "{title} reads the bundles kws-train exports and reproduces its streaming runtime: the same front end from the bundle's own tables, the same cached streaming forward pass, the same detector and the same stage-two spans. Its tests compare features, logits and triggers frame by frame against that runtime on a recorded clip."
+    note: Bundles are chosen by the format field in their json, so a new model family is one more adapter.
     metrics:
-      - value: "14"
-        label: Scales and modes, on any of 12 tonics
-      - value: "40–2000 Hz"
-        label: Pitch tracking range
-      - value: "1024–16384"
-        label: FFT sizes, with hop 128–2048
+      - value: "2"
+        label: Bundle formats, stage one and stage two
+      - value: "100 ms"
+        label: Pushes, as in kws stream
+      - value: "16 kHz"
+        label: Input resampled to the bundle's rate
       - value: "{version}"
         label: "Current release · {license}"
 
   - type: section
-    title: See the note, not just the frequency
+    title: Every trigger where it happened
     index: 1/3
-    lede: Pick a tonic and a scale (major, three minors, five modes, pentatonics, blues, whole tone) and {title} draws its lines across the waterfall, tonic highlighted, A4 tunable from 400 to 480 Hz. Hover anywhere for frequency, nearest note and cents, level in dB, how long ago, and the pitch of that column; turn on harmonic lines to see where the 2nd to 8th partials of that point land.
+    lede: An accepted trigger is a green band over the samples stage one says hold the keyword, with a lighter band for the extra audio stage two reads before it. A rejected one is a red dashed box. Each is labelled with stage two's logit, and the score curve below shows the t1 line it crossed.
 
   - type: media
-    image: waterfall.webp
-    alt: Tonescope showing a melody as a staircase of notes with their harmonics above, a green pitch track along the fundamental, chromatic scale lines labelled on the right and a live spectrum curve beside them
-    caption: "A synthesized melody with eight harmonics, fed through a virtual microphone into {title} {version} on Linux. The green line is the tracked pitch; the hover box reads the point under the cursor."
+    image: triggers.webp
+    alt: Kwscope showing a 42-second read-speech recording with green shaded accepted triggers, a red dashed rejected trigger, stage-two logits above each, and the stage-one score curve with its threshold line below
+    caption: "{title} {version} on Linux with the test bundles imported (untrained weights, so the triggers mean nothing) and 42 seconds of THCHS-30 read speech opened: nine triggers accepted, two rejected."
 
   - type: section
-    title: The fundamental, not the loudest partial
+    title: Move the thresholds, see the answer
     index: 2/3
-    lede: When an overtone is stronger than the fundamental, the pitch readout stays on the fundamental instead of jumping an octave. Frames below the level gate are not measured at all, so silence does not turn into a wandering line. The live spectrum on the right marks both the strongest frequency and the detected pitch, so you can see when they disagree.
+    lede: The t1 and t2 sliders re-run detection on an open recording at once, from cached scores and cached stage-two logits. Drag the time axis, zoom with the wheel, pick a channel of a multichannel file, and export the triggers as JSON lines in the same format as kws stream.
 
   - type: section
-    title: Fast enough to sing along to
+    title: Live, or headless
     index: 3/3
-    lede: Each frame colours only the new columns and updates the texture in place. The frame rate follows the display, can be capped at 60 or 30 fps, and drops on its own when the input stays quiet. The Performance panel breaks down CPU per frame and estimates the delay from sound to screen, split into device, queue, analysis window and display. Space pauses, and a paused picture can still be re-ranged and zoomed.
+    lede: On the microphone the spectrogram scrolls and triggers appear as they fire, with stage two's run time in the sidebar. Without a window, kwscope stream runs the bundles over files and prints one JSON line per trigger, ready to diff against the training side's output.
 ---
