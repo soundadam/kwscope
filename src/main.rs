@@ -8,6 +8,7 @@ mod cli;
 mod colormap;
 mod dsp;
 mod spectrogram;
+mod strip;
 mod worker;
 
 use clap::{Parser, Subcommand};

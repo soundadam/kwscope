@@ -1,10 +1,12 @@
 use crate::audio::{self, Input};
+use crate::axis::Scale;
 use crate::colormap::Colormap;
-use crate::spectrogram::Spectrogram;
+use crate::spectrogram::{Layout, Resolution, Spectrogram, MAX_ROWS};
+use crate::strip::{self, Strip};
 use crate::worker::{self, Cmd, FileView, Handle, Reply};
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, Painter, Pos2, Rect, RichText, Sense, Shape, Slider,
-    Stroke, TextureHandle, TextureOptions,
+    Stroke,
 };
 use kwscope::kws::adapter::{StageOneInfo, StageTwoInfo};
 use kwscope::kws::detector::DetectorConfig;
@@ -31,7 +33,6 @@ const RED: Color32 = Color32::from_rgb(255, 90, 90);
 const SCORE_H: f32 = 140.0;
 const AXIS_H: f32 = 20.0;
 const HZ_GUTTER: f32 = 44.0;
-const FREQ_TICKS: [f32; 9] = [100.0, 200.0, 500.0, 1e3, 2e3, 3e3, 5e3, 8e3, 1.6e4];
 const TIME_STEPS: [f64; 12] = [
     0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0,
 ];
@@ -183,9 +184,9 @@ pub struct App {
     db_hi: f32,
     colormap: Colormap,
     lut: [Color32; 256],
-    texture: Option<TextureHandle>,
-    /// 纹理现在画的是什么；变了才重新着色。
-    painted: Option<(usize, usize, usize, usize, Colormap, f32, f32)>,
+    scale: Scale,
+    resolution: Resolution,
+    strip: Strip,
     selected: Option<usize>,
     /// 这条直播流开始时麦克风已经丢了多少样本。
     dropped_at_start: u64,
@@ -229,8 +230,9 @@ impl App {
             db_hi: -20.0,
             colormap,
             lut: colormap.lut(),
-            texture: None,
-            painted: None,
+            scale: Scale::Mel,
+            resolution: Resolution::Multi,
+            strip: Strip::default(),
             selected: None,
             dropped_at_start: 0,
             updater: appkit::ui::Updater::new(identity, &cc.egui_ctx),
@@ -374,7 +376,6 @@ impl App {
                         end: d.clamp(1.0, 20.0),
                         follow: false,
                     };
-                    self.painted = None;
                 }
                 Reply::Triggers { epoch, triggers } if epoch == self.epoch => {
                     self.timing.add(&triggers);
@@ -785,6 +786,23 @@ impl App {
         if self.colormap != before {
             self.lut = self.colormap.lut();
         }
+        ui.horizontal(|ui| {
+            ui.label("Frequency");
+            for s in Scale::ALL {
+                ui.selectable_value(&mut self.scale, s, s.name());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Resolution");
+            for r in Resolution::ALL {
+                ui.selectable_value(&mut self.resolution, r, r.name());
+            }
+        })
+        .response
+        .on_hover_text(
+            "Multi: a 96 ms window below 500 Hz, 32 ms up to 2 kHz, 16 ms above, \
+             cross-faded over a third of an octave at each edge",
+        );
 
         self.trigger_list(ui);
 
@@ -906,23 +924,33 @@ impl App {
                 let response = ui.allocate_rect(plot, Sense::click_and_drag());
                 self.navigate(ui, &response, plot);
 
+                // 一行一个物理像素
+                let rows = (spec.height() * ctx.pixels_per_point()).round() as usize;
+                self.timeline.spec.set_layout(Layout {
+                    scale: self.scale,
+                    rows: rows.clamp(16, MAX_ROWS),
+                    resolution: self.resolution,
+                });
+
                 let painter = ui.painter_at(full);
-                let texture = self.update_texture(ctx, spec.width());
                 let (t0, t1) = self.window();
-                if let Some((id, lo, hi)) = texture {
+                if let Some(frame) = self.update_texture(ctx, spec.width()) {
                     let x = |t: f64| spec.left() + ((t - t0) / (t1 - t0)) as f32 * spec.width();
                     let s = &self.timeline.spec;
-                    let half = 0.5;
-                    let r = Rect::from_x_y_ranges(
-                        x(s.time_of(lo as f64 - half))..=x(s.time_of(hi as f64 - half)),
-                        spec.y_range(),
-                    );
-                    painter.with_clip_rect(spec).image(
-                        id,
-                        r,
-                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
+                    // 纹理列 j 盖住列 [j·step, (j+1)·step)，每列以自己的中心为中
+                    let edge = |j: usize| x(s.time_of((j * frame.step) as f64 - 0.5));
+                    for seg in &frame.segments {
+                        let (u0, u1) = self.strip.uv(seg);
+                        painter.with_clip_rect(spec).image(
+                            frame.texture,
+                            Rect::from_x_y_ranges(
+                                edge(seg.first)..=edge(seg.first + seg.len),
+                                spec.y_range(),
+                            ),
+                            Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0)),
+                            Color32::WHITE,
+                        );
+                    }
                 }
                 self.draw_freq_ticks(&painter, spec);
                 self.draw_triggers(&painter.with_clip_rect(spec), spec);
@@ -978,38 +1006,24 @@ impl App {
         self.view.end = self.view.end.clamp(lo, hi);
     }
 
-    /// 只着色看得见的列；返回纹理和它盖住的列 [lo, hi)。
-    fn update_texture(
-        &mut self,
-        ctx: &egui::Context,
-        width: f32,
-    ) -> Option<(egui::TextureId, usize, usize)> {
+    /// 只着色看得见、还没画过的列。
+    fn update_texture(&mut self, ctx: &egui::Context, width: f32) -> Option<strip::Frame> {
         let s = &self.timeline.spec;
         let (t0, t1) = self.window();
         let lo = s.column_at(t0).floor().max(0.0) as usize;
         let hi = (s.column_at(t1).ceil().max(0.0) as usize + 1).max(lo + 1);
         let w = ((width as usize).max(1) * 2).min(MAX_TEXTURE_W);
-        let key = (
-            lo,
-            hi,
-            w,
-            s.end().min(hi),
+        let span_cols = (self.view.span / crate::spectrogram::HOP_S).ceil() as usize + 1;
+        self.strip.update(
+            ctx,
+            s,
+            &self.lut,
             self.colormap,
-            self.db_lo,
-            self.db_hi,
-        );
-        if self.painted != Some(key) {
-            let image = s.render(&self.lut, self.db_lo, self.db_hi, lo, hi, w);
-            match &mut self.texture {
-                Some(t) => t.set(image, TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("spectrogram", image, TextureOptions::LINEAR))
-                }
-            }
-            self.painted = Some(key);
-        }
-        Some((self.texture.as_ref()?.id(), lo, hi))
+            (self.db_lo, self.db_hi),
+            (lo, hi),
+            span_cols,
+            w,
+        )
     }
 
     fn time_x(&self, rect: Rect, t: f64) -> f32 {
@@ -1023,11 +1037,8 @@ impl App {
     }
 
     fn draw_freq_ticks(&self, painter: &Painter, spec: Rect) {
-        let axis = self.timeline.spec.axis;
-        for f in FREQ_TICKS
-            .into_iter()
-            .filter(|&f| f >= axis.f_min && f <= axis.f_max)
-        {
+        let axis = self.timeline.spec.axis();
+        for f in axis.ticks(spec.height()) {
             let y = spec.bottom() - axis.unit_of(f) * spec.height();
             painter.line_segment(
                 [pos2(spec.left() - 4.0, y), pos2(spec.left(), y)],
@@ -1230,7 +1241,10 @@ impl App {
         );
         let mut lines = vec![format!("{t:.3} s")];
         if spec.contains(p) {
-            let f = tl.spec.axis.freq_at((spec.bottom() - p.y) / spec.height());
+            let f = tl
+                .spec
+                .axis()
+                .freq_at((spec.bottom() - p.y) / spec.height());
             lines.push(format!("{f:.0} Hz"));
         }
         if !tl.keywords.is_empty() {
