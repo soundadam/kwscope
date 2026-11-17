@@ -1,6 +1,6 @@
 ---
 title: Kwscope
-excerpt: A test bench for wake-word models. Say the word into the microphone and see the moment the model wakes, and why.
+excerpt: "A test bench for wake-word models: import ONNX bundles, speak or open a recording, and see each trigger marked on the spectrogram."
 weight: 40
 presentation:
   category: Speech / macOS + Linux + Windows
@@ -18,8 +18,8 @@ release:
   license: MIT OR Apache-2.0
 modules:
   - type: promo
-    description: Say "Hey Siri" and the phone wakes up. That step is [keyword spotting](https://machinelearning.apple.com/research/voice-trigger), or KWS. {title} is a test bench for wake-word models. Talk into the microphone or open a recording, and every time the model wakes, you see it on the spectrogram.
-    line: "{title} {version} is open source under {license}. Today it is what we use to test our wake-word models in house. Soon we will release an open-weight wake-word model you can load and try."
+    description: "{title} is a test bench for keyword-spotting (KWS) models. Import a stage-one model and an optional stage-two checker, talk into the microphone or open a wav or flac file, and each trigger is marked on the spectrogram above the frame-by-frame score."
+    line: "{title} {version} is open source under {license}: one native executable for macOS, Linux and Windows, written in Rust."
     actions:
       - label: Docs (Chinese)
         url: "{docs}"
@@ -27,9 +27,9 @@ modules:
         url: "https://github.com/{github}"
 
   - type: snapshot
-    title: What you see is what the model decides
-    body: A wake-word model is judged one moment at a time. Did it wake when it should have? Did it stay quiet when it should have? {title} matches the training-side runtime frame by frame, so every trigger on screen is a decision the model would really make once it ships, not an approximation.
-    note: "{title} ships without a model. When the open-weight wake-word model is out, it will be linked from here."
+    title: The same numbers as the training side
+    body: "{title} reproduces the training side's streaming runtime: the same front end, the same cached streaming forward pass, the same detector and stage-two spans. Its tests compare features, logits and triggers frame by frame on a recorded clip."
+    note: "{title} ships without a model; the wake-word model weights are not open yet."
     metrics:
       - value: Two stages
         label: Stage one listens, stage two double-checks
@@ -39,9 +39,9 @@ modules:
         label: "Current release · {license}"
 
   - type: section
-    title: Every wake has a place
+    title: Where each trigger lands
     index: 1/3
-    lede: Green is a wake that was accepted. A red dashed box is a false alarm stage two caught. The number above each is stage two's confidence. Below runs stage one's score; the moment it crosses the yellow dashed line, the model wakes.
+    lede: Green is a wake that was accepted. A red dashed box is a false alarm stage two caught. The number above each is stage two's confidence. Below runs stage one's score with its threshold line.
 
   - type: media
     image: triggers.webp
@@ -49,12 +49,12 @@ modules:
     caption: "{title} {version} on a MacBook Pro, listening to the microphone: four triggers, three accepted, one caught by stage two."
 
   - type: section
-    title: Move a threshold, find where it belongs
+    title: Move a threshold, re-run at once
     index: 2/3
-    lede: Wake words always trade one failure for another. Too eager and it wakes on its own; too cautious and it ignores you. Drag t1 or t2 and the open recording is judged again at once, so you see which wakes appear and which ones vanish.
+    lede: Drag t1 or t2 and the open recording is judged again at once, so you see which triggers appear and which vanish.
 
   - type: section
-    title: At the microphone, and in the pipeline
+    title: Live, or in batch
     index: 3/3
-    lede: The best test is to speak. With the microphone on, the spectrogram scrolls as you talk and each wake is marked as it fires. For a batch of recordings, `kwscope stream` prints one JSON line per trigger, ready for your evaluation.
+    lede: With the microphone on, the spectrogram scrolls and each trigger is marked as it fires. For a batch of recordings, `kwscope stream` prints one JSON line per trigger.
 ---
