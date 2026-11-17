@@ -143,4 +143,4 @@ scripts/package.sh
 
 ## 许可证
 
-[Apache-2.0](LICENSE)，署名见 [NOTICE](NOTICE)。0.2.0 及更早的版本仍可按当时的 MIT 或 Apache-2.0 任选其一使用。
+[Apache-2.0](LICENSE)，署名见 [NOTICE](NOTICE)。
