@@ -15,7 +15,7 @@ registry:
   docs: https://github.com/soundadam/kwscope#readme
 release:
   version: "0.2.0"
-  license: MIT OR Apache-2.0
+  license: Apache-2.0
 modules:
   - type: promo
     description: "{title} is a test bench for keyword-spotting (KWS) models. Import a stage-one model and an optional stage-two checker, talk into the microphone or open a wav or flac file, and each trigger is marked on the spectrogram above the frame-by-frame score."

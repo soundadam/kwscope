@@ -10,7 +10,7 @@ pkgid=$(cargo pkgid)
 version=${pkgid##*[#@]}
 target_dir=${CARGO_TARGET_DIR:-target}
 arch=$(uname -m)
-extras=(README.md LICENSE-MIT LICENSE-APACHE)
+extras=(README.md LICENSE NOTICE)
 
 rm -rf dist
 mkdir -p dist

@@ -15,7 +15,7 @@ registry:
   docs: https://github.com/soundadam/kwscope#readme
 release:
   version: "0.2.0"
-  license: MIT OR Apache-2.0
+  license: Apache-2.0
 modules:
   - type: promo
     description: "{title} 是语音唤醒（KWS）模型的测试台。导入一级模型和可选的二级复核器，对着麦克风说或打开一段 wav / flac，每次触发都标在频谱上，下方是逐帧分数。"

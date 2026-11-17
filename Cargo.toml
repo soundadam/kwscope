@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["soundadam"]
 repository = "https://github.com/soundadam/kwscope"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 description = "Test wake-word models on a live spectrogram: import ONNX bundles, see triggers shaded"
 
 [dependencies]
